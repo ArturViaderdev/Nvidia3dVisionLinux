@@ -1,0 +1,82 @@
+# 3dvisionlinux - configuracion por defecto (~/.config/3dvision/default.conf)
+# Cada juego guarda su propio perfil en ~/.config/3dvision/<Juego.exe>.conf con Ctrl+Shift+F9.
+# Los perfiles se recargan solos si los editas con el juego abierto.
+# Cualquier clave se puede forzar con una variable NV3D_<CLAVE>, p. ej. NV3D_MODE=alternate.
+
+# Desplazamiento de cada ojo en el infinito (1.0 = media pantalla). Mas alto = mas profundidad.
+# Con la rueda del emisor 3D Vision tambien se ajusta.
+separation = 0.02
+
+# Profundidad (en unidades del juego) que queda en el plano de la pantalla.
+# 8.095 con separation 0.02 es el ajuste bueno de Burnout Revenge.
+# metros (Unity, la mayoria): 1-3 | Unreal Engine (centimetros): 100-300
+convergence = 8.095
+
+# Invertir ojos de la imagen si la profundidad se ve "al reves" (Ctrl+Shift+F7)
+swap_eyes = 0
+
+# 1 = 3D, 0 = misma imagen en los dos ojos (el boton del emisor lo alterna)
+stereo = 1
+
+# Modo de 3D:
+#  replay    = cada fotograma del juego se dibuja dos veces (un ojo cada vez). Un juego
+#              a 60 fps da 60 fps por ojo y los dos ojos ven el mismo instante. (por defecto)
+#  alternate = un fotograma para cada ojo; el juego necesita ir a 120 fps para 60 por ojo.
+mode = replay
+
+# Pasar solo de replay a alternate si el juego lee de la GPU en cada fotograma (1/0)
+auto_switch = 1
+
+# El juego espera a la pantalla (como vsync): no dibuja pares que nunca se verian. (1/0)
+game_sync = 1
+
+# Limite extra de fps del juego (0 = sin limite; el ritmo ya lo marca la pantalla)
+fps_limit = 0
+
+# Profundidad del HUD en las mismas unidades que la convergencia. 0 = plano de la pantalla.
+hud_depth = 0
+
+# ---- 3D Vision -------------------------------------------------------------------
+# Usar el emisor USB (1/0)
+emitter = 1
+
+# Retardo de la senal del obturador respecto al refresco, en microsegundos (puede ser negativo).
+# Ajustalo con Ctrl+Shift+Insert / Ctrl+Shift+Supr mirando el patron de prueba (Ctrl+Shift+F10)
+# hasta que el "fantasma" (crosstalk) sea minimo. Depende del monitor.
+emitter_delay_us = 0
+
+# Invertir que cristal se abre (Ctrl+Shift+Fin). Usalo si con el patron de prueba el ojo
+# izquierdo ve negro y el derecho blanco.
+emitter_invert = 0
+
+# El boton del emisor activa/desactiva el 3D (1/0)
+emitter_button = 1
+
+# Frecuencia esperada del monitor (Hz). 0 = medirla (recomendado)
+refresh = 0
+
+# Imagenes del swapchain real: 3 = dos refrescos en cola (robusto), 2 = menos latencia
+present_images = 3
+
+# Patron de prueba: ojo izquierdo blanco, derecho negro (Ctrl+Shift+F10)
+test_pattern = 0
+
+# Lo que presenta la aplicacion: game (un juego: la capa dibuja cada ojo) |
+# sbs (video lado a lado) | tab (video arriba/abajo). Lo usa el reproductor 3dvision-play.
+input = game
+
+# ---- imagen -----------------------------------------------------------------------
+# Zoom: 1 = imagen completa; mayor = acerca (Ctrl+Shift+RePag/AvPag)
+zoom = 1.0
+
+# Recorte de barras negras: 0 = nunca | auto | content | center
+crop = 0
+
+# Ocultar extensiones (graphics pipeline library...) para parchear todos los shaders.
+hide_extensions = 1
+
+# Presentar en una ventana propia a pantalla completa en el monitor principal (0/1)
+own_window = 0
+
+# 0 errores, 1 informacion, 2 detalle
+log_level = 1

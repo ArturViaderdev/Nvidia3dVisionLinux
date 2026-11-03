@@ -1,0 +1,2 @@
+# NVIDIA 3D Vision USB IR emitter: accesible para el usuario (carga de firmware y control)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0955", ATTRS{idProduct}=="0007", MODE="0666", TAG+="uaccess"
