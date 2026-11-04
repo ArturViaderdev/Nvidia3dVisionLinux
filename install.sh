@@ -13,6 +13,12 @@ install_to() {   # $1 = data dir (contiene vulkan/implicit_layer.d), $2 = lib di
   cp build/lib3dvision_layer.so "$2/"
   sed "s#@LIB@#$2/lib3dvision_layer.so#" 3dvision_layer.json.in > "$1/vulkan/implicit_layer.d/3dvision.json"
   echo "  capa -> $1/vulkan/implicit_layer.d/3dvision.json"
+  if [ -f build/lib3dvision_layer32.so ]; then  # 32-bit games
+    cp build/lib3dvision_layer32.so "$2/"
+    sed "s#@LIB@#$2/lib3dvision_layer32.so#; s#VK_LAYER_3DVISION_linux#VK_LAYER_3DVISION_linux_32#" 3dvision_layer.json.in \
+      > "$1/vulkan/implicit_layer.d/3dvision32.json"
+    echo "  capa 32 bits -> $1/vulkan/implicit_layer.d/3dvision32.json"
+  fi
 }
 
 echo "Instalando 3dvisionlinux..."

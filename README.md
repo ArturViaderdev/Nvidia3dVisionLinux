@@ -8,6 +8,7 @@ A Vulkan layer that turns Linux games into **real geometric stereoscopic 3D** an
 
 - Each eye is a full render with its own camera (shader patching, like 3D Vision's automatic mode), not a depth-buffer reprojection.
 - Works with every game that reaches Vulkan: Windows games on Proton/Wine (DX9/10/11 through DXVK, DX12 through VKD3D-Proton, Vulkan) and native Linux Vulkan games.
+- 32-bit and 64-bit games: `install.sh` installs both layers (`lib3dvision_layer.so` and `lib3dvision_layer32.so`). Games that Proton runs with WineD3D (OpenGL, `PROTON_USE_WINED3D=1`) do not use Vulkan and do not get 3D.
 - Drives the emitter directly through the kernel's usbfs (no libusb, no NVIDIA stereo driver needed). Any GPU vendor works; what matters is a monitor running at 100/110/120 Hz.
 - Built on the same engine as [stereo3d](https://github.com/ArturViaderdev/Stereo3DSBSLinux) (SBS output); this project replaces the SBS composition with a frame-sequential presenter and the 3D Vision synchronisation.
 
@@ -172,6 +173,7 @@ Capa Vulkan que convierte los juegos de Linux en **3D estereoscópico geométric
 
 - Cada ojo es un render completo con su propia cámara (parcheo de shaders, como el modo automático de 3D Vision), no una reproyección del buffer de profundidad.
 - Funciona con todo juego que llegue a Vulkan: juegos de Windows con Proton/Wine (DX9/10/11 vía DXVK, DX12 vía VKD3D-Proton, Vulkan) y juegos nativos Vulkan.
+- Juegos de 32 y de 64 bits: `install.sh` instala las dos capas (`lib3dvision_layer.so` y `lib3dvision_layer32.so`). Los juegos que Proton ejecuta con WineD3D (OpenGL, `PROTON_USE_WINED3D=1`) no usan Vulkan y no tienen 3D.
 - Controla el emisor directamente con usbfs del kernel (sin libusb ni driver estéreo de NVIDIA). Vale cualquier marca de GPU; lo importante es un monitor a 100/110/120 Hz.
 - Usa el mismo motor que [stereo3d](https://github.com/ArturViaderdev/Stereo3DSBSLinux) (salida SBS); aquí la composición SBS se sustituye por un presentador secuencial y la sincronización 3D Vision.
 

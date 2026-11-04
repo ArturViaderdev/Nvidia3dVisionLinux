@@ -69,7 +69,7 @@ while :; do
     [ ${#AUD[@]} -gt 0 ] && MAP+=(-map 1:a -c:a aac -b:a 192k)
     echo "$(date '+%F %T') recording $NAME $SIZE @ $FPS fps with $ENC -> $OUT" >> "$LOG"
     "$FF" -hide_banner -loglevel error -nostdin -y \
-      -thread_queue_size 64 -f rawvideo -pix_fmt bgra -video_size "$SIZE" -framerate "$FPS" -i "$FIFO" \
+      -thread_queue_size 8 -f rawvideo -pix_fmt bgra -video_size "$SIZE" -framerate "$FPS" -i "$FIFO" \
       "${AUD[@]}" "${MAP[@]}" "${VENC[@]}" -metadata:s:v:0 stereo_mode=left_right -shortest "$OUT" 2>> "$LOG"
     if [ -s "$OUT" ]; then
       echo "$(date '+%F %T') saved $OUT" >> "$LOG"
