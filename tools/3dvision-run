@@ -1,13 +1,18 @@
 #!/bin/sh
 # Lanzador / launcher: activa 3dvisionlinux y desactiva el vsync/limitador propios de DXVK
-# (el ritmo lo marca la pantalla a traves de la capa).
+# (el ritmo lo marca la pantalla a traves de la capa). Arranca tambien 3dvision-recorder
+# (grabacion de video con Ctrl+Shift+F12).
 # Steam (Propiedades > General > Opciones de lanzamiento):
 #     /home/USUARIO/.local/bin/3dvision-run %command%
+# Lutris: Opciones del sistema > Prefijo del comando: /home/USUARIO/.local/bin/3dvision-run
 # Variantes:   NV3D_MODE=alternate /home/USUARIO/.local/bin/3dvision-run %command%
-# Terminal:    3dvision-run ./juego
 export ENABLE_3DVISION=1
 # el 3D secuencial necesita frecuencia fija: sin G-SYNC / VRR
 export __GL_GSYNC_ALLOWED=0 __GL_VRR_ALLOWED=0
 : "${DXVK_CONFIG:=dxgi.syncInterval=0;d3d9.presentInterval=0;dxgi.maxFrameRate=0;d3d9.maxFrameRate=0}"
 export DXVK_CONFIG
-exec "$@"
+REC="$(dirname "$0")/3dvision-recorder"
+[ -x "$REC" ] || REC="$(command -v 3dvision-recorder)"
+[ -n "$REC" ] && "$REC" --parent $$ </dev/null >/dev/null 2>&1 &
+"$@"
+exit $?

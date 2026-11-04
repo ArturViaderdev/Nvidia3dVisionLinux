@@ -97,11 +97,21 @@ Either way the display always gets left, right, left, right… at the monitor's 
 | F9 | save this game's profile |
 | F10 | test pattern on/off |
 | F11 | capture: game image + left + right eye (PPM) |
+| F12 | start / stop recording a 3D video (full SBS) |
 | Insert / Delete | shutter delay +250 / −250 µs |
 | End | shutter invert |
 | PgUp / PgDn / Home | zoom in / out / reset |
 
 Emitter: wheel = separation, wheel with button pressed = convergence, button = 3D on/off.
+
+## Recording 3D videos
+
+**Ctrl+Shift+F12** starts and stops recording the game as a **full side-by-side** video (left eye | right eye), with the desktop sound, ready for any SBS player (e.g. [3dvision-play](https://github.com/ArturViaderdev/3dvisionvideoplayer)) or 3D TV/glasses.
+
+- Needs `ffmpeg` (`sudo apt install ffmpeg`) and the game started with `3dvision-run` (it starts `3dvision-recorder` in the background).
+- Encoded on the graphics card with **NVENC (HEVC)**: small impact on the game. The layer scales both eyes into one image on the GPU and reads it back; a separate thread hands it to ffmpeg. Without NVENC it falls back to libx264 on the CPU (slower).
+- Files: `~/Videos/3dvision/<Game>-<date>-sbs.mkv` (or `~/Vídeos/...`), constant 60 fps, tagged as side-by-side. Change it with `record_dir`, the size of each eye with `record_width` / `record_height` (default 1920x1080 → 3840x1080 video, `0` = display size), `record_fps`, and `record = 1` to record from the start (`default.conf.example`).
+- The log tells when it starts/stops, frames written and dropped; the recorder's own log is `~/.cache/3dvision/recorder.log`.
 
 ## Configuration
 
@@ -142,6 +152,7 @@ src/spirv_patch.cpp    SPIR-V patcher (stereo shift)
 src/config.cpp         configuration, profiles, logs, hotkeys
 src/output.cpp         optional own output window (X11)
 tools/3dvision-tool    firmware extraction, status, glasses test
+tools/3dvision-recorder  host side of the video recording (ffmpeg)
 tools/3dvision-run     launcher;  tools/set-120hz.sh  monitor mode
 udev/                  udev rule (install-udev.sh)
 tests/                 Vulkan test app, sync simulation
@@ -250,11 +261,21 @@ En los dos casos la pantalla recibe siempre izquierdo, derecho, izquierdo, derec
 | F9 | guardar el perfil del juego |
 | F10 | patrón de prueba sí/no |
 | F11 | captura: imagen del juego + ojo izquierdo + derecho (PPM) |
+| F12 | empezar / parar la grabación de un vídeo 3D (SBS completo) |
 | Insert / Supr | retardo del obturador +250 / −250 µs |
 | Fin | invertir obturador |
 | RePág / AvPág / Inicio | zoom más / menos / restablecer |
 
 Emisor: rueda = separación, rueda con el botón pulsado = convergencia, botón = 3D sí/no.
+
+## Grabar vídeos 3D
+
+**Ctrl+Shift+F12** empieza y para la grabación de la partida como vídeo **SBS completo** (ojo izquierdo | ojo derecho), con el sonido del escritorio, listo para cualquier reproductor SBS (p. ej. [3dvision-play](https://github.com/ArturViaderdev/3dvisionvideoplayer)) o tele/gafas 3D.
+
+- Necesita `ffmpeg` (`sudo apt install ffmpeg`) y arrancar el juego con `3dvision-run` (que lanza `3dvision-recorder` en segundo plano).
+- Se codifica en la gráfica con **NVENC (HEVC)**: apenas afecta al juego. La capa junta los dos ojos en una imagen en la GPU y la lee; un hilo aparte se la pasa a ffmpeg. Sin NVENC usa libx264 en la CPU (más lento).
+- Archivos: `~/Vídeos/3dvision/<Juego>-<fecha>-sbs.mkv` (o `~/Videos/...`), 60 fps constantes, marcados como lado a lado. Se cambia con `record_dir`; el tamaño de cada ojo con `record_width` / `record_height` (por defecto 1920x1080 → vídeo 3840x1080, `0` = tamaño del monitor), `record_fps`, y `record = 1` para grabar desde el inicio (`default.conf.example`).
+- El registro dice cuándo empieza/para, fotogramas escritos y perdidos; el registro del grabador es `~/.cache/3dvision/recorder.log`.
 
 ## Configuración
 
@@ -295,6 +316,7 @@ src/spirv_patch.cpp    parcheador SPIR-V (desplazamiento estéreo)
 src/config.cpp         configuración, perfiles, registros, teclas
 src/output.cpp         ventana propia opcional (X11)
 tools/3dvision-tool    extracción de firmware, estado, prueba de gafas
+tools/3dvision-recorder  parte del grabador de vídeo fuera del juego (ffmpeg)
 tools/3dvision-run     lanzador;  tools/set-120hz.sh  modo del monitor
 udev/                  regla udev (install-udev.sh)
 tests/                 app de prueba Vulkan, simulación de la sincronización

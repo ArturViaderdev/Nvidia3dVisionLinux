@@ -31,6 +31,13 @@ struct Config {
   float refresh = 0.0f;        // expected refresh rate (Hz). 0 = measure
   int presentImages = 3;       // images of the real swapchain (3 = 2 frames queued, robust)
   bool testPattern = false;    // left eye white "L" side, right eye black: sync/crosstalk test
+  bool hideMeshShaders = false;  // hide VK_EXT_mesh_shader so engines use vertex shaders (patched)
+  bool shiftShadows = true;    // false: depth-only pipelines (shadow maps) get no stereo shift
+  bool skipRepeats = false;    // alternate: ignore presents that only repeat the previous image (emulators)
+  int recordWidth = 1920;      // recording: size of each eye in the SBS video (0 = display size)
+  int recordHeight = 1080;
+  float recordFps = 60.0f;     // constant frame rate of the recording
+  bool recordAtStart = false;  // start recording as soon as the game shows (NV3D_RECORD=1)
   int inputLayout = 0;         // 0 game (render each eye), 1 SBS input (left/right halves), 2 top-bottom input
 };
 
@@ -50,6 +57,8 @@ bool PollControls();
 
 // Frame capture (Ctrl+Shift+F11 or NV3D_DUMP=<frame>): returns true once per request.
 bool TakeDumpRequest(uint64_t frame);
+// Ctrl+Shift+F12: start / stop recording. Returns true once per key press.
+bool TakeRecordToggle();
 std::string DumpDir();
 
 }  // namespace stereo3d

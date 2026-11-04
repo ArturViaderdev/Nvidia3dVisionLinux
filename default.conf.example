@@ -65,6 +65,18 @@ test_pattern = 0
 # sbs (video lado a lado) | tab (video arriba/abajo). Lo usa el reproductor 3dvision-play.
 input = game
 
+# ---- grabacion de video 3D (Ctrl+Shift+F12 empieza / para) ----------------------------
+# Graba SBS completo (ojo izquierdo | ojo derecho) con el sonido del escritorio, codificado
+# con NVENC (HEVC) en la grafica. Necesita ffmpeg y lanzar el juego con 3dvision-run.
+# Carpeta de destino (por defecto ~/Videos/3dvision o ~/Vídeos/3dvision)
+#record_dir = ~/Vídeos/3dvision
+# Tamano de CADA ojo en el video (0 = el del monitor). 1920x1080 -> video 3840x1080
+record_width = 1920
+record_height = 1080
+record_fps = 60
+# 1 = empezar a grabar al arrancar el juego
+record = 0
+
 # ---- imagen -----------------------------------------------------------------------
 # Zoom: 1 = imagen completa; mayor = acerca (Ctrl+Shift+RePag/AvPag)
 zoom = 1.0

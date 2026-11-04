@@ -1,0 +1,83 @@
+#!/bin/bash
+# 3dvision-recorder - host side of the 3dvisionlinux video recording (Ctrl+Shift+F12 in game).
+# The layer (inside the game's container) writes raw full-SBS frames into a FIFO; this script
+# encodes them with ffmpeg (NVENC if available) plus the desktop audio, outside the container.
+# Started automatically by 3dvision-run. Manual use: 3dvision-recorder [--parent PID]
+#
+# Output folder: record_dir in ~/.config/3dvision/default.conf, or NV3D_RECORD_DIR
+# (default ~/Videos/3dvision). Encoder: NV3D_RECORD_ENCODER (default hevc_nvenc).
+PARENT=""
+[ "$1" = "--parent" ] && PARENT="$2"
+DIR="${XDG_CACHE_HOME:-$HOME/.cache}/3dvision"
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/3dvision/default.conf"
+mkdir -p "$DIR"
+conf() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CFG" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//'; }
+OUTDIR="${NV3D_RECORD_DIR:-$(conf record_dir)}"
+if [ -z "$OUTDIR" ]; then
+  OUTDIR="$(xdg-user-dir VIDEOS 2>/dev/null)"
+  [ -n "$OUTDIR" ] && [ "$OUTDIR" != "$HOME" ] || OUTDIR="$HOME/Videos"
+  OUTDIR="$OUTDIR/3dvision"
+fi
+OUTDIR="${OUTDIR/#\~/$HOME}"
+LOG="$DIR/recorder.log"
+
+# ffmpeg: NV3D_FFMPEG, else the distribution's (it has NVENC and x264), else whatever is in PATH
+FF="${NV3D_FFMPEG:-}"
+[ -z "$FF" ] && [ -x /usr/bin/ffmpeg ] && FF=/usr/bin/ffmpeg
+[ -z "$FF" ] && FF="$(command -v ffmpeg)"
+[ -n "$FF" ] || { echo "$(date '+%F %T') ffmpeg not found (sudo apt install ffmpeg)" >> "$LOG"; exit 1; }
+exec 9>"$DIR/recorder.lock"
+flock -n 9 || exit 0   # already running for another game
+
+FIFO="$DIR/record.fifo"
+rm -f "$FIFO"
+find "$DIR" -maxdepth 1 -name record.start -mmin +0.2 -delete 2>/dev/null   # stale requests only
+mkfifo "$FIFO"
+trap 'rm -f "$FIFO" "$DIR/record.start"' EXIT
+
+# first encoder that really works (NVENC also needs the driver's libnvidia-encode)
+ENC=""
+for e in ${NV3D_RECORD_ENCODER:-} hevc_nvenc h264_nvenc libx264 mpeg4; do
+  if err=$("$FF" -hide_banner -loglevel error -nostdin -f lavfi -i color=black:s=256x256:d=0.1 -c:v "$e" -f null - 2>&1); then
+    ENC="$e"; break
+  fi
+  echo "$(date '+%F %T') $FF: encoder $e not usable: $(echo "$err" | grep -v -e "Nothing was written" -e "^$" | head -2 | tr "\n" " ")" >> "$LOG"
+done
+[ -n "$ENC" ] || { echo "$(date '+%F %T') no usable video encoder in $FF" >> "$LOG"; exit 1; }
+case "$ENC" in
+  *_nvenc) VENC=(-c:v "$ENC" -preset p4 -tune hq -rc vbr -cq 20 -b:v 0) ;;
+  libx264) VENC=(-c:v libx264 -preset ultrafast -crf 20) ;;
+  mpeg4)   VENC=(-c:v mpeg4 -q:v 3) ;;
+  *)       VENC=(-c:v "$ENC") ;;
+esac
+echo "$(date '+%F %T') ready: $FF, encoder $ENC, output $OUTDIR" >> "$LOG"
+
+while :; do
+  if [ -n "$PARENT" ] && ! kill -0 "$PARENT" 2>/dev/null; then exit 0; fi
+  if [ -f "$DIR/record.start" ]; then
+    read -r NAME SIZE FPS < "$DIR/record.start"
+    rm -f "$DIR/record.start"
+    NAME="${NAME%.exe}"; NAME="${NAME%.EXE}"
+    mkdir -p "$OUTDIR"
+    OUT="$OUTDIR/${NAME:-game}-$(date +%Y%m%d-%H%M%S)-sbs.mkv"
+    AUD=()
+    if command -v pactl >/dev/null; then
+      SINK="$(pactl get-default-sink 2>/dev/null)"
+      [ -n "$SINK" ] && AUD=(-thread_queue_size 4096 -f pulse -i "$SINK.monitor")
+    fi
+    MAP=(-map 0:v)
+    [ ${#AUD[@]} -gt 0 ] && MAP+=(-map 1:a -c:a aac -b:a 192k)
+    echo "$(date '+%F %T') recording $NAME $SIZE @ $FPS fps with $ENC -> $OUT" >> "$LOG"
+    "$FF" -hide_banner -loglevel error -nostdin -y \
+      -thread_queue_size 64 -f rawvideo -pix_fmt bgra -video_size "$SIZE" -framerate "$FPS" -i "$FIFO" \
+      "${AUD[@]}" "${MAP[@]}" "${VENC[@]}" -metadata:s:v:0 stereo_mode=left_right -shortest "$OUT" 2>> "$LOG"
+    if [ -s "$OUT" ]; then
+      echo "$(date '+%F %T') saved $OUT" >> "$LOG"
+      command -v notify-send >/dev/null && notify-send -a 3dvision "3D video saved" "$OUT" 2>/dev/null
+    else
+      echo "$(date '+%F %T') FAILED, nothing recorded (see the ffmpeg error above)" >> "$LOG"
+      rm -f "$OUT"
+    fi
+  fi
+  sleep 0.3
+done

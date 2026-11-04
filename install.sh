@@ -26,7 +26,8 @@ fi
 
 mkdir -p "$HOME/.local/bin"
 cp tools/3dvision-run "$HOME/.local/bin/3dvision-run"
-chmod +x "$HOME/.local/bin/3dvision-run"
+cp tools/3dvision-recorder "$HOME/.local/bin/3dvision-recorder"
+chmod +x "$HOME/.local/bin/3dvision-run" "$HOME/.local/bin/3dvision-recorder"
 [ -f build/3dvision-tool ] && cp build/3dvision-tool "$HOME/.local/bin/3dvision-tool"
 echo "  lanzador -> $HOME/.local/bin/3dvision-run"
 echo "  herramienta del emisor -> $HOME/.local/bin/3dvision-tool"

@@ -22,7 +22,11 @@
 
 #include <algorithm>
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdio>
 #include <atomic>
 #include <chrono>
@@ -77,7 +81,7 @@ namespace {
   X(ResetCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdBlitImage)               \
   X(CmdUpdateBuffer) X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CreateFence) X(DestroyFence) X(WaitForFences)  \
   X(ResetFences) X(CreateSemaphore) X(DestroySemaphore) X(WaitSemaphores) X(WaitSemaphoresKHR)  \
-  X(GetFenceStatus) X(WaitForPresentKHR)
+  X(GetFenceStatus) X(WaitForPresentKHR) X(InvalidateMappedMemoryRanges)
 
 struct InstDispatch {
 #define DECL(n) PFN_vk##n n = nullptr;
@@ -176,7 +180,7 @@ struct Swapchain {
   int ready = -1;                // newest complete pair, not shown yet
   int writing = -1;              // pair being filled (alternate mode: between L and R frames)
   int busy[kSlots] = {};         // presenter copies in flight that read the pair
-  uint64_t pairsPublished = 0, pairsShown = 0;
+  uint64_t pairsPublished = 0, pairsShown = 0, statPublished = 0;
 
   // ---- presenter thread
   VkCommandPool presPool = VK_NULL_HANDLE;
@@ -185,6 +189,7 @@ struct Swapchain {
   std::atomic<bool> stop{false};
   std::atomic<int> presError{VK_SUCCESS};  // error to report to the game (out of date, lost...)
   std::atomic<uint64_t> refreshes{0};      // frames presented by the presenter
+  struct Recorder* rec = nullptr;          // video recording (Ctrl+Shift+F12)
 };
 
 struct ModuleEntry {
@@ -209,6 +214,7 @@ struct DeviceData {
   VkQueue presQueue = VK_NULL_HANDLE;   // our own queue for the presenter thread
   int32_t presQueueIndex = -1;          // index in gfxFamily (-1: shared with the game)
   bool presentWait = false;             // VK_KHR_present_id + VK_KHR_present_wait enabled by us
+  bool recordResume = false;            // a recording was running on a destroyed swapchain
 
   OutputWindow* out = nullptr;     // own window on the glasses monitor
   VkSurfaceKHR outSurface = VK_NULL_HANDLE;
@@ -221,7 +227,7 @@ struct DeviceData {
 
   std::mutex shaderLock;
   std::unordered_map<VkShaderModule, ModuleEntry> modules;
-  std::atomic<uint32_t> patchedCount{0}, skippedCount{0}, pipelineCount{0};
+  std::atomic<uint32_t> patchedCount{0}, skippedCount{0}, pipelineCount{0}, depthOnlyCount{0};
 
   std::mutex swapLock;
   std::unordered_map<VkSwapchainKHR, Swapchain*> swapchains;
@@ -242,6 +248,11 @@ struct DeviceData {
   std::mutex semLock;
   std::unordered_set<VkSemaphore> timelineSems;
   std::atomic<uint32_t> monoFrames{0}, replayFrames{0};
+  // skip_repeats: GPU work submitted since the last present (command buffers), to recognise
+  // presents that only show the previous image again (emulators presenting faster than the game)
+  std::atomic<uint64_t> work{0};
+  double workEma = 0;
+  std::atomic<uint32_t> repeatFrames{0};
   std::atomic<uint64_t> presentCount{0};
   std::atomic<int> swapCount{0};
   std::atomic<uint64_t> lastAbortPresent{0};
@@ -293,9 +304,15 @@ const char* const kAlwaysHidden[] = {
 const char* const kShaderPathHidden[] = {
     "VK_EXT_graphics_pipeline_library",
 };
+// Hidden with hide_mesh_shaders = 1: mesh-shader geometry gets no stereo shift (e.g. UE5 Nanite),
+// without these extensions VKD3D-Proton reports no mesh shader support and engines fall back
+const char* const kMeshHidden[] = {"VK_EXT_mesh_shader", "VK_NV_mesh_shader"};
 bool IsHidden(const char* name) {
   for (const char* h : kAlwaysHidden)
     if (!strcmp(h, name)) return true;
+  if (Cfg().hideMeshShaders)
+    for (const char* h : kMeshHidden)
+      if (!strcmp(h, name)) return true;
   if (Cfg().hideExtensions)
     for (const char* h : kShaderPathHidden)
       if (!strcmp(h, name)) return true;
@@ -504,10 +521,14 @@ void WatchdogMain(DeviceData* dd) {
       LogThreads();
       if (dd->replay) {
         if (dd->recLock.try_lock()) {
+          size_t held = dd->heldFences.size() + dd->heldTimeline.size() + dd->recCbs.size();
           Log(0, "  held: %zu fences, %zu timeline semaphores, %zu command buffers -> releasing",
               dd->heldFences.size(), dd->heldTimeline.size(), dd->recCbs.size());
           AbortReplayLocked(dd, "watchdog");
-          if (level == 2) {
+          // nothing held back by replay: the game is just busy (loading, compiling shaders);
+          // replay is not the cause, keep it
+          if (level == 2 && held == 0) Log(0, "  nothing held by replay: the game is busy (loading?), staying in replay");
+          if (level == 2 && held > 0) {
             Log(0, "  still stalled: switching to alternate mode");
             dd->replay = false;
             dd->recMono = false;
@@ -795,6 +816,9 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice phys, const Vk
 
 struct Swapchain;
 void StopPresenter(DeviceData* dd, Swapchain* sc);
+struct Recorder;
+void DestroyRecorder(Recorder* r);
+Recorder* CreateRecorder(DeviceData* dd, Swapchain* sc);
 
 VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* a) {
   DeviceData* dd = Dev(device);
@@ -803,7 +827,11 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device, const VkAllocatio
   if (dd->watchdog.joinable()) dd->watchdog.join();
   {  // swapchains the app did not destroy: stop their presenter threads
     std::lock_guard<std::mutex> l(dd->swapLock);
-    for (auto& kv : dd->swapchains) StopPresenter(dd, kv.second);
+    for (auto& kv : dd->swapchains) {
+      DestroyRecorder(kv.second->rec);
+      kv.second->rec = nullptr;
+      StopPresenter(dd, kv.second);
+    }
   }
   {
     std::lock_guard<std::mutex> l(dd->shaderLock);
@@ -922,6 +950,7 @@ bool RecordingQueue(DeviceData* dd, VkQueue q) {
 
 VKAPI_ATTR VkResult VKAPI_CALL hook_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
   DeviceData* dd = Dev(q);
+  for (uint32_t i = 0; i < n; ++i) dd->work += s[i].commandBufferCount;
   if (!dd->replay) {
     std::lock_guard<std::mutex> l(GetQueueInfo(dd, q)->m);
     return dd->d.QueueSubmit(q, n, s, f);
@@ -975,6 +1004,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_QueueSubmit(VkQueue q, uint32_t n, const VkS
 
 VkResult Submit2Common(DeviceData* dd, VkQueue q, uint32_t n, const VkSubmitInfo2* s, VkFence f,
                        PFN_vkQueueSubmit2 fn) {
+  for (uint32_t i = 0; i < n; ++i) dd->work += s[i].commandBufferInfoCount;
   if (!dd->replay) {
     std::lock_guard<std::mutex> l(GetQueueInfo(dd, q)->m);
     return fn(q, n, s, f);
@@ -1241,6 +1271,23 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateGraphicsPipelines(VkDevice device, VkP
       if (rank > bestRank) { bestRank = rank; best = int(s); }
     }
     if (best < 0) continue;
+    if (!Cfg().shiftShadows) {
+      // depth-only pipelines (shadow maps...): no stereo shift. Shadow maps are seen from the light,
+      // they must be the same for both eyes. (A depth pre-pass would also be skipped: per-game option.)
+      bool hasFrag = false;
+      for (uint32_t s2 = 0; s2 < ci[i].stageCount; ++s2) hasFrag |= ci[i].pStages[s2].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+      bool noColor = false;
+      if (ci[i].renderPass == VK_NULL_HANDLE) {  // dynamic rendering: the attachment formats are in pNext
+        noColor = true;
+        for (auto* p = (const VkBaseInStructure*)ci[i].pNext; p; p = p->pNext)
+          if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+            noColor = ((const VkPipelineRenderingCreateInfo*)p)->colorAttachmentCount == 0;
+      }
+      if (!hasFrag || noColor) {
+        ++dd->depthOnlyCount;
+        continue;
+      }
+    }
     ++dd->pipelineCount;
     const VkPipelineShaderStageCreateInfo& st = ci[i].pStages[best];
     uint32_t model = StageToModel(st.stage);
@@ -2112,6 +2159,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateSwapchainKHR(VkDevice device, const Vk
       sc->format, realFormat, sc->canBlit);
   if (Cfg().emitter) SyncStart();
   sc->presThread = std::thread(PresenterMain, dd, sc);
+  if (dd->recordResume) {
+    dd->recordResume = false;
+    sc->rec = CreateRecorder(dd, sc);
+  }
   return VK_SUCCESS;
 }
 
@@ -2132,9 +2183,24 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroySwapchainKHR(VkDevice device, VkSwapchain
       dd->swapchains.erase(it);
     }
   }
+  bool wasRecording = false;
   if (sc) {
     --dd->swapCount;
+    if (sc->rec) {  // keep recording on the next swapchain (resolution change, alt-tab...)
+      wasRecording = true;
+      DestroyRecorder(sc->rec);
+      sc->rec = nullptr;
+    }
     StopPresenter(dd, sc);
+  }
+  if (wasRecording) {  // continue (in a new file) on the swapchain that replaced this one
+    Swapchain* other = nullptr;
+    {
+      std::lock_guard<std::mutex> l(dd->swapLock);
+      if (!dd->swapchains.empty()) other = dd->swapchains.begin()->second;
+    }
+    if (other && !other->rec) other->rec = CreateRecorder(dd, other);
+    else dd->recordResume = true;
   }
   if (sc && dd->replay) {
     std::lock_guard<std::mutex> rl(dd->recLock);
@@ -2266,13 +2332,14 @@ void LogStats(DeviceData* dd, Swapchain* sc, bool replayStats) {
     std::lock_guard<std::mutex> l(sc->pm);
     published = sc->pairsPublished;
   }
-  static uint64_t lastPublished = 0;
-  double pairs = (published - lastPublished) / el;
-  lastPublished = published;
+  double pairs = published >= sc->statPublished ? (published - sc->statPublished) / el : 0.0;
+  sc->statPublished = published;
   if (replayStats) {
     uint32_t rf = dd->replayFrames.exchange(0), mf = dd->monoFrames.exchange(0);
     // the game needs GPU results in the middle of its frames: replay cannot work, use alternate
-    if (Cfg().autoSwitch && mf > rf && rf + mf >= 30) {
+    // only judge real gameplay: menus, intros and loading screens (few shaders so far) often
+    // wait for the GPU every frame and would switch good replay games to alternate for good
+    if (Cfg().autoSwitch && mf > rf && rf + mf >= 30 && dd->patchedCount.load() >= 60) {
       if (++dd->badReplayWindows >= 2) {
         Log(0, "this game reads back from the GPU every frame (%u of %u frames 2D): switching to alternate "
             "mode (3D at half the game fps). Use mode = alternate in its profile to skip this.", mf, rf + mf);
@@ -2289,12 +2356,347 @@ void LogStats(DeviceData* dd, Swapchain* sc, bool replayStats) {
         sc->statFrames / el, pairs, rf, mf, dd->patchedCount.load(), Cfg().separation, Cfg().convergence,
         Cfg().stereo ? "" : " [2D]");
   } else {
-    Log(1, "game %.1f fps -> %.1f stereo pairs/s [alternate] | shaders patched %u, skipped %u | sep %.4f conv %.3f%s",
-        sc->statFrames / el, pairs, dd->patchedCount.load(), dd->skippedCount.load(), Cfg().separation,
+    Log(1, "game %.1f fps -> %.1f stereo pairs/s [alternate%s, repeated presents skipped %u] | shaders patched %u, "
+        "skipped %u, depth-only pipelines unshifted %u | sep %.4f conv %.3f%s",
+        sc->statFrames / el, pairs, Cfg().skipRepeats ? " skip_repeats" : "", dd->repeatFrames.exchange(0),
+        dd->patchedCount.load(), dd->skippedCount.load(), dd->depthOnlyCount.load(), Cfg().separation,
         Cfg().convergence, Cfg().stereo ? "" : " [2D]");
   }
   sc->statFrames = 0;
   sc->statStart = now;
+}
+
+// ------------------------------------------------------------------------------------
+// Recording (Ctrl+Shift+F12): every stereo pair is scaled into a full-SBS image on the GPU,
+// read back and written as raw BGRA frames, at a constant frame rate, into a FIFO read by
+// 3dvision-recorder (ffmpeg + NVENC on the host, outside the game's container).
+// ------------------------------------------------------------------------------------
+std::string RecordDir() {
+  std::string base;
+  if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) base = x;
+  else if (const char* h = getenv("HOME"); h && *h) base = std::string(h) + "/.cache";
+  else base = "/tmp";
+  return base + "/3dvision";
+}
+
+struct RecBuf {
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  void* map = nullptr;
+  bool coherent = true;
+  VkFence fence = VK_NULL_HANDLE;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  double t = 0;
+  bool busy = false;
+};
+constexpr int kRecBufs = 4;
+
+struct Recorder {
+  DeviceData* dd = nullptr;
+  uint32_t w = 0, h = 0;  // per eye
+  VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+  VkImage img = VK_NULL_HANDLE;
+  VkDeviceMemory imgMem = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  RecBuf b[kRecBufs];
+  VkDeviceSize frameBytes = 0;
+  std::thread th;
+  std::mutex m;
+  std::condition_variable cv;
+  std::vector<int> queue;  // buffers waiting to be written, in order
+  bool stop = false;
+  double lastCapture = -1;
+  std::atomic<uint64_t> captured{0}, dropped{0}, written{0};
+  std::atomic<bool> failed{false};  // no recorder: stop capturing
+};
+
+void RecorderThread(Recorder* r) {
+  pthread_setname_np(pthread_self(), "3dvision-record");
+  sigset_t ss;  // a dead reader must not kill the game with SIGPIPE
+  sigemptyset(&ss);
+  sigaddset(&ss, SIGPIPE);
+  pthread_sigmask(SIG_BLOCK, &ss, nullptr);
+  DeviceData* dd = r->dd;
+  // ask the host recorder to start ffmpeg, then connect to its FIFO
+  std::string dir = RecordDir();
+  {
+    std::string tmp = dir + "/record.start.tmp";
+    if (FILE* f = fopen(tmp.c_str(), "w")) {
+      fprintf(f, "%s %ux%u %.3f\n", GameName().c_str(), r->w * 2, r->h, Cfg().recordFps);
+      fclose(f);
+      rename(tmp.c_str(), (dir + "/record.start").c_str());
+    }
+  }
+  int fd = -1;
+  bool spawned = false;
+  for (int i = 0; i < 160 && fd < 0 && !r->stop; ++i) {  // up to 8 s
+    fd = open((dir + "/record.fifo").c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) break;
+    if (i == 10 && !spawned) {
+      // no recorder: the game was not started with 3dvision-run. Start it ourselves (works for
+      // native games; inside the Steam runtime container the host's ffmpeg may be missing)
+      spawned = true;
+      const char* home = getenv("HOME");
+      std::string exe = std::string(home ? home : "") + "/.local/bin/3dvision-recorder";
+      if (access(exe.c_str(), X_OK) == 0) {
+        std::string pid = std::to_string(getpid());
+        if (fork() == 0) {
+          setsid();
+          int nul = open("/dev/null", O_RDWR);
+          if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
+          execl(exe.c_str(), exe.c_str(), "--parent", pid.c_str(), (char*)nullptr);
+          _exit(127);
+        }
+        Log(1, "recording: started %s", exe.c_str());
+        // it must see the start request again (it deletes stale ones when it starts)
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::string tmp = dir + "/record.start.tmp";
+        if (FILE* f = fopen(tmp.c_str(), "w")) {
+          fprintf(f, "%s %ux%u %.3f\n", GameName().c_str(), r->w * 2, r->h, Cfg().recordFps);
+          fclose(f);
+          rename(tmp.c_str(), (dir + "/record.start").c_str());
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (fd < 0) {
+    r->failed = true;
+    Log(0, "recording: 3dvision-recorder is not running and could not be started (start the game with "
+           "3dvision-run; see ~/.cache/3dvision/recorder.log). Not recording.");
+  } else {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+    Log(0, "recording: started (%ux%u full SBS, %.0f fps)", r->w * 2, r->h, Cfg().recordFps);
+  }
+  const double period = 1.0 / Cfg().recordFps;
+  double t0 = -1;
+  int64_t lastIndex = -1;
+  bool ok = fd >= 0;
+  for (;;) {
+    int bi;
+    {
+      std::unique_lock<std::mutex> l(r->m);
+      r->cv.wait(l, [&] { return r->stop || !r->queue.empty(); });
+      if (r->queue.empty()) break;  // stop requested and everything written
+      bi = r->queue.front();
+      r->queue.erase(r->queue.begin());
+    }
+    RecBuf& rb = r->b[bi];
+    dd->d.WaitForFences(dd->device, 1, &rb.fence, VK_TRUE, 2000000000ull);
+    if (ok) {
+      if (!rb.coherent) {
+        VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        mr.memory = rb.mem;
+        mr.size = VK_WHOLE_SIZE;
+        dd->d.InvalidateMappedMemoryRanges(dd->device, 1, &mr);
+      }
+      // constant frame rate: repeat this frame to fill gaps, drop it if it is early
+      if (t0 < 0) t0 = rb.t;
+      int64_t idx = int64_t((rb.t - t0) / period + 0.5);
+      int64_t n = lastIndex < 0 ? 1 : idx - lastIndex;
+      if (n > int64_t(Cfg().recordFps) * 2) n = 1;  // long pause (menu, loading): don't fill it
+      for (int64_t k = 0; k < n && ok; ++k) {
+        const char* p = (const char*)rb.map;
+        size_t left = size_t(r->frameBytes);
+        while (left && ok) {
+          ssize_t wr = write(fd, p, left);
+          if (wr < 0) {
+            if (errno == EINTR) continue;
+            Log(0, "recording: the recorder stopped (%s)", strerror(errno));
+            ok = false;
+            r->failed = true;
+            break;
+          }
+          p += wr;
+          left -= size_t(wr);
+        }
+        if (ok) ++r->written;
+      }
+      if (n > 0) lastIndex = lastIndex < 0 ? 0 : lastIndex + n;
+    }
+    std::lock_guard<std::mutex> l(r->m);
+    rb.busy = false;
+  }
+  if (fd >= 0) close(fd);  // EOF: ffmpeg finishes the file
+  Log(0, "recording: stopped (%llu frames written, %llu game pairs captured, %llu dropped)",
+      (unsigned long long)r->written.load(), (unsigned long long)r->captured.load(),
+      (unsigned long long)r->dropped.load());
+}
+
+void DestroyRecorder(Recorder* r) {
+  if (!r) return;
+  DeviceData* dd = r->dd;
+  {
+    std::lock_guard<std::mutex> l(r->m);
+    r->stop = true;
+  }
+  r->cv.notify_all();
+  if (r->th.joinable()) r->th.join();
+  for (auto& rb : r->b) {
+    if (rb.fence) dd->d.WaitForFences(dd->device, 1, &rb.fence, VK_TRUE, 2000000000ull);
+    if (rb.map) dd->d.UnmapMemory(dd->device, rb.mem);
+    if (rb.buf) dd->d.DestroyBuffer(dd->device, rb.buf, nullptr);
+    if (rb.mem) dd->d.FreeMemory(dd->device, rb.mem, nullptr);
+    if (rb.fence) dd->d.DestroyFence(dd->device, rb.fence, nullptr);
+    if (rb.cmd) dd->d.FreeCommandBuffers(dd->device, r->pool, 1, &rb.cmd);
+  }
+  if (r->pool) dd->d.DestroyCommandPool(dd->device, r->pool, nullptr);
+  if (r->img) dd->d.DestroyImage(dd->device, r->img, nullptr);
+  if (r->imgMem) dd->d.FreeMemory(dd->device, r->imgMem, nullptr);
+  delete r;
+}
+
+Recorder* CreateRecorder(DeviceData* dd, Swapchain* sc) {
+  auto* r = new Recorder();
+  r->dd = dd;
+  r->w = Cfg().recordWidth ? uint32_t(Cfg().recordWidth) & ~1u : sc->rext.width;
+  r->h = Cfg().recordHeight ? uint32_t(Cfg().recordHeight) & ~1u : sc->rext.height;
+  // keep the encoded values: sRGB swapchains are copied into an sRGB image (no conversion)
+  const bool srgb = sc->realFormat == VK_FORMAT_B8G8R8A8_SRGB || sc->realFormat == VK_FORMAT_R8G8B8A8_SRGB;
+  r->fmt = srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+  VkFormatProperties src{}, dst{};
+  dd->inst->d.GetPhysicalDeviceFormatProperties(dd->phys, sc->realFormat, &src);
+  dd->inst->d.GetPhysicalDeviceFormatProperties(dd->phys, r->fmt, &dst);
+  if (!(src.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+      !(dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+    Log(0, "recording: format %d cannot be scaled on this GPU", sc->realFormat);
+    delete r;
+    return nullptr;
+  }
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = r->fmt;
+  ici.extent = {r->w * 2, r->h, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  bool ok = CreateImageMem(dd, ici, &r->img, &r->imgMem);
+  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  pci.queueFamilyIndex = dd->gfxFamily;
+  ok &= dd->d.CreateCommandPool(dd->device, &pci, nullptr, &r->pool) == VK_SUCCESS;
+  r->frameBytes = VkDeviceSize(r->w) * 2 * r->h * 4;
+  for (auto& rb : r->b) {
+    if (!ok) break;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = r->frameBytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    ok &= dd->d.CreateBuffer(dd->device, &bci, nullptr, &rb.buf) == VK_SUCCESS;
+    if (!ok) break;
+    VkMemoryRequirements req;
+    dd->d.GetBufferMemoryRequirements(dd->device, rb.buf, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    // cached memory: the CPU reads it (uncached reads are very slow)
+    ai.memoryTypeIndex = FindMemType(dd, req.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX ||
+        !(dd->memProps.memoryTypes[ai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+      ai.memoryTypeIndex = FindMemType(dd, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    ok &= dd->d.AllocateMemory(dd->device, &ai, nullptr, &rb.mem) == VK_SUCCESS;
+    if (!ok) break;
+    rb.coherent = (dd->memProps.memoryTypes[ai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    dd->d.BindBufferMemory(dd->device, rb.buf, rb.mem, 0);
+    ok &= dd->d.MapMemory(dd->device, rb.mem, 0, VK_WHOLE_SIZE, 0, &rb.map) == VK_SUCCESS;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    ok &= dd->d.CreateFence(dd->device, &fci, nullptr, &rb.fence) == VK_SUCCESS;
+    ok &= AllocCmd(dd, r->pool, &rb.cmd);
+  }
+  mkdir(RecordDir().c_str(), 0755);
+  if (!ok) {
+    Log(0, "recording: cannot allocate the recording buffers");
+    DestroyRecorder(r);
+    return nullptr;
+  }
+  r->th = std::thread(RecorderThread, r);
+  return r;
+}
+
+void ToggleRecording(DeviceData* dd, Swapchain* sc) {
+  if (sc->rec) {
+    DestroyRecorder(sc->rec);
+    sc->rec = nullptr;
+  } else {
+    sc->rec = CreateRecorder(dd, sc);
+  }
+}
+
+// After the game's submits for a pair, on the same queue: pair -> SBS image -> host buffer
+void CapturePair(DeviceData* dd, Swapchain* sc, VkQueue q, int slot) {
+  Recorder* r = sc->rec;
+  if (!r || r->failed.load()) return;
+  double now = NowSeconds();
+  const double period = 1.0 / Cfg().recordFps;
+  if (r->lastCapture >= 0 && now - r->lastCapture < period * 0.75) return;  // game faster than the video
+  int bi = -1;
+  {
+    std::lock_guard<std::mutex> l(r->m);
+    for (int i = 0; i < kRecBufs; ++i)
+      if (!r->b[i].busy) { bi = i; break; }
+    if (bi < 0) {  // the encoder is behind: drop this pair (the recorder repeats the previous one)
+      ++r->dropped;
+      return;
+    }
+    r->b[bi].busy = true;
+  }
+  r->lastCapture = now;
+  RecBuf& rb = r->b[bi];
+  dd->d.WaitForFences(dd->device, 1, &rb.fence, VK_TRUE, UINT64_MAX);
+  dd->d.ResetFences(dd->device, 1, &rb.fence);
+  VkCommandBuffer cb = rb.cmd;
+  dd->d.ResetCommandBuffer(cb, 0);
+  VkCommandBufferBeginInfo bi2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  dd->d.BeginCommandBuffer(cb, &bi2);
+  const VkPipelineStageFlags XFER = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  Barrier(dd, cb, r->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, XFER, 0, XFER,
+          VK_ACCESS_TRANSFER_WRITE_BIT);
+  for (int e = 0; e < 2; ++e) {
+    VkImage src = sc->slots[slot].img[e];
+    Barrier(dd, cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, XFER, VK_ACCESS_TRANSFER_WRITE_BIT, XFER,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageBlit b{};
+    b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {int32_t(sc->rext.width), int32_t(sc->rext.height), 1};
+    b.dstOffsets[0] = {int32_t(e * r->w), 0, 0};
+    b.dstOffsets[1] = {int32_t((e + 1) * r->w), int32_t(r->h), 1};
+    dd->d.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, r->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                       VK_FILTER_LINEAR);
+  }
+  Barrier(dd, cb, r->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, XFER,
+          VK_ACCESS_TRANSFER_WRITE_BIT, XFER, VK_ACCESS_TRANSFER_READ_BIT);
+  VkBufferImageCopy c{};
+  c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  c.imageExtent = {r->w * 2, r->h, 1};
+  dd->d.CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buf, 1, &c);
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  dd->d.CmdPipelineBarrier(cb, XFER, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+  dd->d.EndCommandBuffer(cb);
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cb;
+  VkResult res;
+  {
+    std::lock_guard<std::mutex> l(GetQueueInfo(dd, q)->m);
+    res = dd->d.QueueSubmit(q, 1, &si, rb.fence);
+  }
+  std::lock_guard<std::mutex> l(r->m);
+  if (res != VK_SUCCESS) {
+    rb.busy = false;
+    return;
+  }
+  rb.t = now;
+  ++r->captured;
+  r->queue.push_back(bi);
+  r->cv.notify_one();
 }
 
 // Alternate mode: even frames = left eye, odd frames = right eye of the same pair.
@@ -2304,6 +2706,23 @@ VkResult PresentAlternate(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t
   VImage& vi = sc->v[idx];
   const uint64_t frame = dd->frame;
   const bool stereoInput = Cfg().inputLayout != 0;  // every frame is a whole pair (SBS / top-bottom video)
+  if (Cfg().skipRepeats && !stereoInput) {
+    // a present with (almost) no GPU work since the previous one shows the same image again:
+    // keep the eye and the pair as they are, otherwise the eyes get out of step with the frames
+    uint64_t w = dd->work.exchange(0);
+    bool repeat = dd->workEma > 0 && double(w) < dd->workEma * 0.25;
+    if (!repeat) dd->workEma = dd->workEma > 0 ? dd->workEma * 0.9 + double(w) * 0.1 : double(w);
+    if (repeat) {
+      ++dd->repeatFrames;
+      std::vector<VkPipelineStageFlags> st(waitCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};  // consume the game's semaphores
+      si.waitSemaphoreCount = waitCount;
+      si.pWaitSemaphores = waits;
+      si.pWaitDstStageMask = st.data();
+      std::lock_guard<std::mutex> l(GetQueueInfo(dd, queue)->m);
+      return waitCount ? dd->d.QueueSubmit(queue, 1, &si, VK_NULL_HANDLE) : VK_SUCCESS;
+    }
+  }
   const bool right = !stereoInput && (frame & 1) != 0;
   bool both = false;  // first frame after a reset: the pair has no left eye yet
   int slot;
@@ -2382,6 +2801,7 @@ VkResult PresentAlternate(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t
   if (right || both) {
     SignalWritten(dd, subQueue, sc, slot);
     Publish(sc, slot);
+    CapturePair(dd, sc, subQueue, slot);
   }
   FinishCapture(dd, sc, cap, vi.fence, frame);
   if (detect) {
@@ -2495,6 +2915,7 @@ VkResult PresentReplay(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t id
     if (sr != VK_SUCCESS) return sr;
   }
   Publish(sc, slot);
+  CapturePair(dd, sc, queue, slot);
   if (doReplay) ++dd->replayFrames;
   FinishCapture(dd, sc, cap, vi.fence, dd->frame);
   if (detect) {
@@ -2517,10 +2938,13 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_QueuePresentKHR(VkQueue queue, const VkPrese
     return dd->d.QueuePresentKHR(queue, pi);
   }
   PollControls();
+  if (TakeRecordToggle())
+    for (Swapchain* sc : scs)
+      if (sc) { ToggleRecording(dd, sc); break; }
   // game sync: frames that complete a pair wait until the display took the previous pair
   dd->stage = "present: waiting for the display (game sync)";
   for (Swapchain* sc : scs)
-    if (sc && (dd->replay || (dd->frame & 1) || Cfg().inputLayout)) WaitForDisplay(sc);
+    if (sc && !Cfg().skipRepeats && (dd->replay || (dd->frame & 1) || Cfg().inputLayout)) WaitForDisplay(sc);
 
   VkResult overall = VK_SUCCESS;
   for (uint32_t i = 0; i < pi->swapchainCount; ++i) {

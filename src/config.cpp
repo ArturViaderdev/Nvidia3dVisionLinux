@@ -96,6 +96,14 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "refresh") && ParseFloat(val, f)) g_cfg.refresh = f;
   else if (!strcmp(key, "present_images") && ParseFloat(val, f)) g_cfg.presentImages = std::clamp(int(f), 2, 4);
   else if (!strcmp(key, "test_pattern") && ParseBool(val, b)) g_cfg.testPattern = b;
+  else if (!strcmp(key, "record_width") && ParseFloat(val, f)) g_cfg.recordWidth = std::max(0, int(f));
+  else if (!strcmp(key, "record_height") && ParseFloat(val, f)) g_cfg.recordHeight = std::max(0, int(f));
+  else if (!strcmp(key, "record_fps") && ParseFloat(val, f)) g_cfg.recordFps = std::clamp(f, 10.0f, 240.0f);
+  else if (!strcmp(key, "record") && ParseBool(val, b)) g_cfg.recordAtStart = b;
+  else if (!strcmp(key, "record_dir")) {}  // used by 3dvision-recorder
+  else if (!strcmp(key, "hide_mesh_shaders") && ParseBool(val, b)) g_cfg.hideMeshShaders = b;
+  else if (!strcmp(key, "shift_shadows") && ParseBool(val, b)) g_cfg.shiftShadows = b;
+  else if (!strcmp(key, "skip_repeats") && ParseBool(val, b)) g_cfg.skipRepeats = b;
   else if (!strcmp(key, "input"))  // what the application presents: a game, or already-stereo video frames
     g_cfg.inputLayout = !strcasecmp(val, "sbs") ? 1 : (!strcasecmp(val, "tab") || !strcasecmp(val, "ou")) ? 2 : 0;
 }
@@ -166,7 +174,8 @@ static void LoadEnv() {
                                 "auto_switch", "fps_limit", "game_sync", "own_window", "mode", "crop",
                                 "hide_extensions", "patch_shaders", "log_level", "hotkeys", "emitter",
                                 "emitter_delay_us", "emitter_invert", "emitter_button", "refresh",
-                                "present_images", "test_pattern", "input"};
+                                "present_images", "test_pattern", "input", "skip_repeats", "shift_shadows", "hide_mesh_shaders", "record_width",
+                                "record_height", "record_fps", "record"};
   for (const char* k : kKeys) {
     std::string env = "NV3D_";
     for (const char* c = k; *c; ++c) env += char(toupper(*c));
@@ -244,6 +253,7 @@ void SaveConfig() {
           g_cfg.mode ? "replay" : "alternate", g_cfg.zoom, g_cfg.fpsLimit, g_cfg.hudDepth, g_cfg.autoSwitch);
   fprintf(f, "crop = %s\n", g_cfg.crop < 0 ? "auto" : g_cfg.crop == 1 ? "center" : g_cfg.crop == 2 ? "content" : "0");
   fprintf(f, "emitter_delay_us = %.0f\nemitter_invert = %d\n", g_cfg.emitterDelayUs, g_cfg.emitterInvert);
+  fprintf(f, "skip_repeats = %d\nshift_shadows = %d\n", g_cfg.skipRepeats, g_cfg.shiftShadows);
   fclose(f);
   struct stat st;
   if (stat(g_profile.c_str(), &st) == 0) g_profileMtime = st.st_mtime;
@@ -265,11 +275,12 @@ struct X11 {
 X11 g_x;
 
 enum Key { kCtrlL, kCtrlR, kShiftL, kShiftR, kF3, kF4, kF5, kF6, kF7, kF8, kF9, kF10, kF11,
-           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kCount };
+           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kF12, kCount };
 const unsigned long kSyms[kCount] = {0xFFE3, 0xFFE4, 0xFFE1, 0xFFE2, 0xFFC0, 0xFFC1, 0xFFC2, 0xFFC3,
                                      0xFFC4, 0xFFC5, 0xFFC6, 0xFFC7, 0xFFC8, 0xFF55, 0xFF56, 0xFF50,
-                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57};
+                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57, 0xFFC9};
 bool g_dumpRequested = false;
+bool g_recordToggle = false;
 
 bool InitX11() {
   if (g_x.tried) return g_x.ok;
@@ -285,7 +296,7 @@ bool InitX11() {
   for (int i = 0; i < kCount; ++i) g_x.kc[i] = g_x.KeysymToKeycode(g_x.dpy, kSyms[i]);
   g_x.ok = true;
   Log(1, "hotkeys: Ctrl+Shift + F3/F4 sep -/+  F5/F6 conv -/+  F7 swap eyes  F8 3D on/off  F9 save  F10 test pattern  "
-         "F11 capture  Ins/Del shutter delay +/-  End shutter invert  PgUp/PgDn zoom  Home zoom=1  F1/F2 HUD depth");
+         "F11 capture  F12 record video  Ins/Del shutter delay +/-  End shutter invert  PgUp/PgDn zoom  Home zoom=1  F1/F2 HUD depth");
   return true;
 }
 
@@ -310,6 +321,17 @@ bool TakeDumpRequest(uint64_t frame) {
     return true;
   }
   return false;
+}
+
+bool TakeRecordToggle() {
+  static bool first = true;
+  if (first) {  // NV3D_RECORD=1 / record = 1: start right away
+    first = false;
+    if (g_cfg.recordAtStart) return true;
+  }
+  if (!g_recordToggle) return false;
+  g_recordToggle = false;
+  return true;
 }
 
 std::string DumpDir() {
@@ -369,6 +391,7 @@ bool PollControls() {
   if (pressed(kDel)) { g_cfg.emitterDelayUs -= 250; Log(1, "emitter_delay_us=%.0f", g_cfg.emitterDelayUs); }
   if (pressed(kEnd)) { g_cfg.emitterInvert = !g_cfg.emitterInvert; Log(1, "emitter_invert=%d", g_cfg.emitterInvert); }
   if (pressed(kF11)) { g_dumpRequested = true; Log(1, "capture requested"); }
+  if (pressed(kF12)) g_recordToggle = true;
   if (pressed(kHome)) { g_cfg.zoom = 1.0f; changed = true; Log(1, "zoom=1"); }
   static bool wasAdjusting = false;
   bool adjusting = mod && (cur[kF3] || cur[kF4] || cur[kF5] || cur[kF6] || cur[kPgUp] || cur[kPgDn] || cur[kF1] || cur[kF2]);
