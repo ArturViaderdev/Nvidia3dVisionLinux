@@ -76,7 +76,7 @@ In-game settings: **1920x1080 fullscreen**, **no TAA/DLSS/FSR2+/frame generation
 
 1. Start a game (or any Vulkan program fullscreen, e.g. `NV3D_PATCH=0 3dvision-run vkcube`) and press **Ctrl+Shift+F10**: test pattern, left eye white, right eye black.
 2. Close your right eye: you should see **white**. Close your left eye: **black**. If it is the other way round press **Ctrl+Shift+End** (shutter invert).
-3. With one eye closed, press **Ctrl+Shift+Insert / Ctrl+Shift+Delete** (shutter delay ±250 µs) until the eye that should see black sees the least grey ghost.
+3. With one eye closed, press **Ctrl+Shift+Insert / Ctrl+Shift+Delete** (shutter delay ±25 µs) until the eye that should see black sees the least grey ghost.
 4. Ctrl+Shift+F10 again to go back to the game and **Ctrl+Shift+F9** to save. The delay is a property of your monitor: copy `emitter_delay_us` / `emitter_invert` into `~/.config/3dvision/default.conf` so every game uses it.
 5. Then the usual depth tuning: F3/F4 separation, F5/F6 convergence (also the emitter's wheel; the emitter's button toggles 3D).
 
@@ -103,7 +103,7 @@ Either way the display always gets left, right, left, right… at the monitor's 
 | F10 | test pattern on/off |
 | F11 | capture: game image + left + right eye (PPM) |
 | F12 | start / stop recording a 3D video (full SBS) |
-| Insert / Delete | shutter delay +250 / −250 µs |
+| Insert / Delete | shutter delay +25 / −25 µs |
 | End | shutter invert |
 | PgUp / PgDn / Home | zoom in / out / reset |
 
@@ -245,7 +245,7 @@ Ajustes del juego: **1920x1080 pantalla completa**, **sin TAA/DLSS/FSR2+/generac
 
 1. Arranca un juego (o cualquier programa Vulkan a pantalla completa, p. ej. `NV3D_PATCH=0 3dvision-run vkcube`) y pulsa **Ctrl+Shift+F10**: patrón de prueba, ojo izquierdo blanco, derecho negro.
 2. Cierra el ojo derecho: debes ver **blanco**. Cierra el izquierdo: **negro**. Si es al revés pulsa **Ctrl+Shift+Fin** (invertir obturador).
-3. Con un ojo cerrado, pulsa **Ctrl+Shift+Insert / Ctrl+Shift+Supr** (retardo del obturador ±250 µs) hasta que el ojo que debe ver negro vea el mínimo fantasma gris.
+3. Con un ojo cerrado, pulsa **Ctrl+Shift+Insert / Ctrl+Shift+Supr** (retardo del obturador ±25 µs) hasta que el ojo que debe ver negro vea el mínimo fantasma gris.
 4. Ctrl+Shift+F10 otra vez para volver al juego y **Ctrl+Shift+F9** para guardar. El retardo depende de tu monitor: copia `emitter_delay_us` / `emitter_invert` a `~/.config/3dvision/default.conf` para que valga en todos los juegos.
 5. Luego el ajuste de profundidad de siempre: F3/F4 separación, F5/F6 convergencia (también con la rueda del emisor; su botón activa/desactiva el 3D).
 
@@ -272,7 +272,7 @@ En los dos casos la pantalla recibe siempre izquierdo, derecho, izquierdo, derec
 | F10 | patrón de prueba sí/no |
 | F11 | captura: imagen del juego + ojo izquierdo + derecho (PPM) |
 | F12 | empezar / parar la grabación de un vídeo 3D (SBS completo) |
-| Insert / Supr | retardo del obturador +250 / −250 µs |
+| Insert / Supr | retardo del obturador +25 / −25 µs |
 | Fin | invertir obturador |
 | RePág / AvPág / Inicio | zoom más / menos / restablecer |
 

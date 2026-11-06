@@ -391,8 +391,8 @@ bool PollControls() {
   if (pressed(kF8)) { g_cfg.stereo = !g_cfg.stereo; changed = true; Log(1, "stereo=%d", g_cfg.stereo); }
   if (pressed(kF9)) SaveConfig();
   if (pressed(kF10)) { g_cfg.testPattern = !g_cfg.testPattern; Log(1, "test_pattern=%d", g_cfg.testPattern); }
-  if (pressed(kIns)) { g_cfg.emitterDelayUs += 250; Log(1, "emitter_delay_us=%.0f", g_cfg.emitterDelayUs); }
-  if (pressed(kDel)) { g_cfg.emitterDelayUs -= 250; Log(1, "emitter_delay_us=%.0f", g_cfg.emitterDelayUs); }
+  if (pressed(kIns)) { g_cfg.emitterDelayUs += 25; Log(1, "emitter_delay_us=%.0f", g_cfg.emitterDelayUs); }
+  if (pressed(kDel)) { g_cfg.emitterDelayUs -= 25; Log(1, "emitter_delay_us=%.0f", g_cfg.emitterDelayUs); }
   if (pressed(kEnd)) { g_cfg.emitterInvert = !g_cfg.emitterInvert; Log(1, "emitter_invert=%d", g_cfg.emitterInvert); }
   if (pressed(kF11)) { g_dumpRequested = true; Log(1, "capture requested"); }
   if (pressed(kF12)) g_recordToggle = true;
