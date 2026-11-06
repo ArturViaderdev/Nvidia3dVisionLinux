@@ -427,7 +427,8 @@ void SyncThread() {
   prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);  // wake up on time (default slack is 50 us)
 
   Emitter em;
-  double nextOpenTry = 0, nextKeys = 0, nextStat = NowSeconds() + 10;
+  double nextOpenTry = 0, nextKeys = 0, nextStat = NowSeconds() + 10, nextRate = 0;
+  double rateEma = 0;
   bool warnedOpen = false;
   while (s.run.load()) {
     double now = NowSeconds();
@@ -458,7 +459,18 @@ void SyncThread() {
       SleepUntil(now + 0.004);
       continue;
     }
-    if (std::fabs(hz - em.Rate()) > 0.25 && !em.SetRate(hz)) ++s.usbErrors;
+    // The emitter times the shutters with its own clock, programmed with set_rate; set_eye only
+    // says which eye comes next. If that clock runs even 0.1 Hz off the display, the shutters
+    // slide across the frames and the eyes swap every few seconds (then snap back). The first
+    // measurement can be that far off, so follow the refined model closely (no extra latency:
+    // it only reprograms the emitter's period).
+    rateEma = rateEma > 0 ? rateEma + (hz - rateEma) * 0.02 : hz;  // smooth the model's jitter
+    if (std::fabs(rateEma - em.Rate()) > 0.003 && now >= nextRate) {
+      nextRate = now + 2.0;
+      double before = em.Rate();
+      if (em.SetRate(rateEma)) Log(1, "3D Vision: emitter clock %.3f -> %.3f Hz", before, rateEma);
+      else ++s.usbErrors;
+    }
 
     const double delay = double(Cfg().emitterDelayUs) * 1e-6;
     double vb;

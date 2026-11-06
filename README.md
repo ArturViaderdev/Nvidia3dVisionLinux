@@ -65,6 +65,7 @@ Steam → game properties → General → Launch options:
 | Case | Add in front |
 |---|---|
 | Games that read back from the GPU every frame (EDF5/EDF6), emulators | `NV3D_MODE=alternate` |
+| Those games when they are capped at 60 fps (30 per eye in alternate) | `NV3D_MODE=depth` |
 | Force replay without automatic fallback | `NV3D_MODE=replay NV3D_AUTO_SWITCH=0` |
 | Sync / ghosting test pattern from the start | `NV3D_TEST_PATTERN=1` |
 | Vulkan 1.0 apps (older native games) | `NV3D_LEGACY=1` |
@@ -83,6 +84,9 @@ In-game settings: **1920x1080 fullscreen**, **no TAA/DLSS/FSR2+/frame generation
 
 - **replay** (default): the game renders each frame once; the layer submits the same commands again with the other eye's camera. A game at 60 fps gives **60 fps per eye** with both eyes at the same instant. Twice the GPU work. If the game needs GPU results mid-frame, those frames are 2D and the layer falls back to alternate by itself.
 - **alternate**: one game frame per eye; the game must run at 120 fps for 60 per eye.
+- **depth**: for games that cannot use replay and are capped at 60 fps (alternate would give 30 per eye). The game renders one normal image per frame; the layer copies the scene's depth buffer right after the main pass and rebuilds **both eyes** from the image and the depth (60 fps per eye). It also learns how the game's depth maps to distance from samples stored by the patched shaders, so convergence works in the game's units as in the other modes. Limits: small halos where the background is uncovered next to near objects, and the HUD takes the depth of what is behind it. Needs DXVK / VKD3D-Proton (dynamic rendering); the log says when a game is not supported.
+
+Replay starts after a **warm-up** of `replay_warmup` seconds (default 8) in alternate: intros, shader compilation and loading screens that would hang in replay get going first (`NV3D_REPLAY_WARMUP=0` disables it).
 
 Either way the display always gets left, right, left, right… at the monitor's refresh. If the game is slower, the last stereo pair is repeated: the eye order never breaks, you only see a lower frame rate.
 
@@ -230,6 +234,7 @@ Steam → propiedades del juego → General → Opciones de lanzamiento:
 | Caso | Añadir delante |
 |---|---|
 | Juegos que leen de la GPU en cada fotograma (EDF5/EDF6), emuladores | `NV3D_MODE=alternate` |
+| Esos juegos cuando están limitados a 60 fps (30 por ojo en alternate) | `NV3D_MODE=depth` |
 | Forzar replay sin cambio automático | `NV3D_MODE=replay NV3D_AUTO_SWITCH=0` |
 | Patrón de prueba de sincronización / fantasma desde el inicio | `NV3D_TEST_PATTERN=1` |
 | Apps Vulkan 1.0 (juegos nativos antiguos) | `NV3D_LEGACY=1` |
@@ -248,6 +253,9 @@ Ajustes del juego: **1920x1080 pantalla completa**, **sin TAA/DLSS/FSR2+/generac
 
 - **replay** (por defecto): el juego dibuja cada fotograma una vez y la capa vuelve a enviar los mismos comandos con la cámara del otro ojo. Un juego a 60 fps da **60 fps por ojo** y los dos ojos ven el mismo instante. Doble trabajo para la GPU. Si el juego necesita resultados de la GPU a mitad de fotograma, esos fotogramas salen en 2D y la capa pasa sola a alternate.
 - **alternate**: un fotograma del juego por ojo; el juego necesita 120 fps para 60 por ojo.
+- **depth**: para juegos que no pueden usar replay y están limitados a 60 fps (en alternate darían 30 por ojo). El juego dibuja una imagen normal por fotograma; la capa copia el búfer de profundidad de la escena justo después del pase principal y reconstruye **los dos ojos** a partir de la imagen y la profundidad (60 fps por ojo). Aprende cómo se traduce la profundidad del juego a distancia con muestras que guardan los shaders parcheados, así que la convergencia va en las mismas unidades que en los otros modos. Límites: pequeños halos donde se destapa el fondo junto a objetos cercanos, y el HUD toma la profundidad de lo que tiene detrás. Necesita DXVK / VKD3D-Proton (dynamic rendering); el log avisa si un juego no es compatible.
+
+El modo replay empieza tras un **calentamiento** de `replay_warmup` segundos (8 por defecto) en alternate: las intros, la compilación de shaders y las pantallas de carga que se colgarían en replay arrancan primero (`NV3D_REPLAY_WARMUP=0` lo desactiva).
 
 En los dos casos la pantalla recibe siempre izquierdo, derecho, izquierdo, derecho… al ritmo del monitor. Si el juego va más lento se repite el último par: el orden de los ojos nunca se rompe, solo ves menos fps.
 

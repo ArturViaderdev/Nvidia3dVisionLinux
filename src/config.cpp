@@ -78,7 +78,9 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "fps_limit") && ParseFloat(val, f)) g_cfg.fpsLimit = f;
   else if (!strcmp(key, "game_sync") && ParseBool(val, b)) g_cfg.gameSync = b;
   else if (!strcmp(key, "own_window") && ParseBool(val, b)) g_cfg.ownWindow = b ? 1 : 0;
-  else if (!strcmp(key, "mode")) g_cfg.mode = !strcasecmp(val, "replay") ? 1 : 0;
+  else if (!strcmp(key, "mode"))
+    g_cfg.mode = !strcasecmp(val, "replay") ? 1 : !strcasecmp(val, "depth") ? 2 : 0;
+  else if (!strcmp(key, "replay_warmup") && ParseFloat(val, f)) g_cfg.replayWarmup = std::max(0.0f, f);
   else if (!strcmp(key, "crop")) {
     if (!strcasecmp(val, "auto")) g_cfg.crop = -1;
     else if (!strcasecmp(val, "center")) g_cfg.crop = 1;
@@ -175,7 +177,7 @@ static void LoadEnv() {
                                 "hide_extensions", "patch_shaders", "log_level", "hotkeys", "emitter",
                                 "emitter_delay_us", "emitter_invert", "emitter_button", "refresh",
                                 "present_images", "test_pattern", "input", "skip_repeats", "shift_shadows", "hide_mesh_shaders", "record_width",
-                                "record_height", "record_fps", "record"};
+                                "record_height", "record_fps", "record", "replay_warmup"};
   for (const char* k : kKeys) {
     std::string env = "NV3D_";
     for (const char* c = k; *c; ++c) env += char(toupper(*c));
@@ -190,6 +192,8 @@ static void LoadEnv() {
   if (const char* v = getenv("NV3D_HIDE_EXT")) ApplyKey("hide_extensions", v);
   if (const char* v = getenv("NV3D_DELAY")) ApplyKey("emitter_delay_us", v);
 }
+
+const char* ModeName(int mode) { return mode == 1 ? "replay" : mode == 2 ? "depth" : "alternate"; }
 
 void LoadConfig() {
   static bool loaded = false;
@@ -234,7 +238,7 @@ void LoadConfig() {
   }
   Log(1, "game=%s profile=%s%s sep=%.4f conv=%.3f swap=%d mode=%s emitter=%d delay=%.0fus", g_game.c_str(),
       g_profile.c_str(), had ? "" : " (new)", g_cfg.separation, g_cfg.convergence, g_cfg.swapEyes,
-      g_cfg.mode ? "replay" : "alternate", g_cfg.emitter, g_cfg.emitterDelayUs);
+      ModeName(g_cfg.mode), g_cfg.emitter, g_cfg.emitterDelayUs);
 }
 
 void SaveConfig() {
@@ -250,7 +254,7 @@ void SaveConfig() {
   fprintf(f, "separation = %.5f\nconvergence = %.5f\nswap_eyes = %d\nstereo = %d\n",
           g_cfg.separation, g_cfg.convergence, g_cfg.swapEyes, g_cfg.stereo);
   fprintf(f, "mode = %s\nzoom = %.4f\nfps_limit = %.1f\nhud_depth = %.4f\nauto_switch = %d\n",
-          g_cfg.mode ? "replay" : "alternate", g_cfg.zoom, g_cfg.fpsLimit, g_cfg.hudDepth, g_cfg.autoSwitch);
+          ModeName(g_cfg.mode), g_cfg.zoom, g_cfg.fpsLimit, g_cfg.hudDepth, g_cfg.autoSwitch);
   fprintf(f, "crop = %s\n", g_cfg.crop < 0 ? "auto" : g_cfg.crop == 1 ? "center" : g_cfg.crop == 2 ? "content" : "0");
   fprintf(f, "emitter_delay_us = %.0f\nemitter_invert = %d\n", g_cfg.emitterDelayUs, g_cfg.emitterInvert);
   fprintf(f, "skip_repeats = %d\nshift_shadows = %d\n", g_cfg.skipRepeats, g_cfg.shiftShadows);

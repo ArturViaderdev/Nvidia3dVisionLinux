@@ -16,7 +16,9 @@ struct Config {
   bool hotkeys = true;
   bool passthrough = false;    // launcher/helper process: layer does nothing
   int ownWindow = 0;           // 0 present on the game window (default), 1 own full-screen window
-  int mode = 1;                // 1 replay (both eyes every game frame, default), 0 alternate (L/R frames)
+  int mode = 1;                // 1 replay (both eyes every game frame, default), 0 alternate (L/R frames),
+                               // 2 depth (one game frame -> both eyes, rebuilt from the depth buffer)
+  float replayWarmup = 8.0f;   // replay: seconds of alternate at start (intros, shader compilation)
   float fpsLimit = 0.0f;       // extra game fps cap (pairs per second in replay). 0 = only the display sync
   bool gameSync = true;        // the game waits for the display (no frames rendered just to be dropped)
   float hudDepth = 0.0f;       // apparent depth of the HUD (same units as convergence). 0 = screen plane
@@ -44,6 +46,7 @@ struct Config {
 Config& Cfg();
 float HudFactor();            // 1 - convergence / hud_depth (0 when hud_depth = 0)
 void LoadConfig();            // env + config files; call once at startup
+const char* ModeName(int mode);
 void SaveConfig();            // writes per-game profile
 const std::string& GameName();
 std::string ProfilePath();

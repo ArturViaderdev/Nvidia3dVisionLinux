@@ -22,7 +22,12 @@ stereo = 1
 #  replay    = cada fotograma del juego se dibuja dos veces (un ojo cada vez). Un juego
 #              a 60 fps da 60 fps por ojo y los dos ojos ven el mismo instante. (por defecto)
 #  alternate = un fotograma para cada ojo; el juego necesita ir a 120 fps para 60 por ojo.
+#  depth     = un fotograma normal del juego -> los dos ojos, reconstruidos con el buffer de
+#              profundidad. Para juegos limitados a 60 fps que no admiten replay (60 por ojo).
 mode = replay
+
+# Segundos en alternate al arrancar antes de pasar a replay (intros, carga de shaders). 0 = no
+replay_warmup = 8
 
 # Pasar solo de replay a alternate si el juego lee de la GPU en cada fotograma (1/0)
 auto_switch = 1

@@ -1,0 +1,113 @@
+// 3dvisionlinux - depth mode: builds both eyes from one mono game frame and its depth buffer.
+// PASS 0 (splat): every game pixel is pushed to where it lands in each eye; the nearest wins.
+// PASS 1 (resolve): each eye pixel takes the colour of the game pixel that won it; holes
+//                   (background uncovered by the shift) take the farther neighbour.
+// Compile: glslangValidator -V --target-env vulkan1.2 -DPASS=0 depth3d.comp (see gen.sh)
+#version 450
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32s { uint v[]; };
+layout(push_constant) uniform PC {
+  U32s color;   // game image, W*H 32-bit pixels
+  U32s depth;   // raw depth copy (Dw*Dh texels)
+  U32s keys;    // 2*W*H: winner per eye pixel ((nearness+1) << 12 | source x), 0 = empty
+  U32s outc;    // 2*W*H: eye images
+  U32s meta;    // [0] Dw [1] Dh [2] format 0 f32, 1 unorm24, 2 unorm16 [3] copies
+  uint W, H;
+  float a, b;   // z_ndc = a + b / w (from the projection samples)
+  float kL, kR; // per-eye shift at infinity (NDC); 0 = 2D
+  float conv;   // depth (game units) on the screen plane
+  float maxShift;
+} pc;
+
+float DepthAt(uint idx, uint fmt) {
+  if (fmt == 2u) {
+    uint word = pc.depth.v[idx >> 1];
+    return float((idx & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu)) / 65535.0;
+  }
+  if (fmt == 1u) return float(pc.depth.v[idx] & 0xFFFFFFu) / 16777215.0;
+  return uintBitsToFloat(pc.depth.v[idx]);
+}
+
+// 1/w of the game pixel (x, y), no dilation (0 if there is no depth)
+float InvWAt(uint x, uint y) {
+  uint Dw = pc.meta.v[0], Dh = pc.meta.v[1];
+  if (Dw == 0u || Dh == 0u || pc.b == 0.0) return 0.0;
+  uint idx = min(y * Dh / pc.H, Dh - 1u) * Dw + min(x * Dw / pc.W, Dw - 1u);
+  float iw = (DepthAt(idx, pc.meta.v[2]) - pc.a) / pc.b;
+  return iw > 0.0 ? iw : 0.0;
+}
+
+void main() {
+  uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+  if (x >= pc.W || y >= pc.H) return;
+  uint WH = pc.W * pc.H;
+#if PASS == 0
+  uint Dw = pc.meta.v[0], Dh = pc.meta.v[1], fmt = pc.meta.v[2];
+  bool have = Dw > 0u && Dh > 0u && pc.b != 0.0;
+  float invW = 0.0;
+  if (have) {
+    // nearest of five neighbours: edge pixels (blends of object and background from antialiasing,
+    // TAA or scaling) move with the object instead of being left behind as a halo
+    uint dy = min(y * Dh / pc.H, Dh - 1u);
+    for (int o = -2; o <= 2; ++o) {
+      uint dx = uint(clamp(int(x * Dw / pc.W) + o, 0, int(Dw) - 1));
+      float iw = (DepthAt(dy * Dw + dx, fmt) - pc.a) / pc.b;
+      if (iw > invW) invW = iw;  // (NaN never wins)
+    }
+    invW = min(invW, 1.0e30);
+  }
+  float base = 1.0 - pc.conv * invW;
+  uint key = (((floatBitsToUint(invW) >> 11) + 1u) << 12) | x;
+  for (uint e = 0u; e < 2u; ++e) {
+    float k = e == 0u ? pc.kL : pc.kR;
+    float shift = have ? clamp(k * base * float(pc.W) * 0.5, -pc.maxShift, pc.maxShift) : 0.0;
+    int i0 = int(floor(float(x) + shift));
+    for (int j = 0; j < 2; ++j) {
+      int xi = i0 + j;
+      if (xi >= 0 && xi < int(pc.W)) atomicMax(pc.keys.v[e * WH + y * pc.W + uint(xi)], key);
+    }
+  }
+#else
+  if (pc.maxShift < 0.0) {  // debug (NV3D_DEPTH_SHOW=1): both eyes show the raw depth as grey
+    uint Dw = pc.meta.v[0], Dh = pc.meta.v[1], fmt = pc.meta.v[2];
+    float d = 0.0;
+    if (Dw > 0u) {
+      d = DepthAt(min(y * Dh / pc.H, Dh - 1u) * Dw + min(x * Dw / pc.W, Dw - 1u), fmt);
+    }
+    uint g = uint(clamp(d, 0.0, 1.0) * 255.0);
+    pc.outc.v[y * pc.W + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
+    pc.outc.v[WH + y * pc.W + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
+    return;
+  }
+  for (uint e = 0u; e < 2u; ++e) {
+    uint row = e * WH + y * pc.W;
+    uint key = pc.keys.v[row + x];
+    uint sx = x;
+    if (key == 0u) {
+      // A hole: background uncovered next to a nearer object that moved. The real content is not
+      // in the image; continue the background by mirroring it across the edge (keeps its texture,
+      // unlike repeating one pixel, which draws streaks), skipping the blended edge pixels.
+      uint kl = 0u, kr = 0u, rl = 0u, rr = 0u;
+      for (uint r = 1u; r <= 96u && kl == 0u && r <= x; ++r) { kl = pc.keys.v[row + x - r]; rl = r; }
+      for (uint r = 1u; r <= 96u && kr == 0u && x + r < pc.W; ++r) { kr = pc.keys.v[row + x + r]; rr = r; }
+      bool left = kl != 0u && (kr == 0u || (kl >> 12) < (kr >> 12));
+      uint k2 = left ? kl : kr;
+      if (k2 != 0u) {
+        int edge = int(k2 & 0xFFFu);
+        int near = left ? edge - 2 : edge + 2;
+        int cand = left ? near - int(rl) : near + int(rr);
+        near = clamp(near, 0, int(pc.W) - 1);
+        cand = clamp(cand, 0, int(pc.W) - 1);
+        // the mirrored pixel must be background too, not another near object
+        float bg = uintBitsToFloat(((k2 >> 12) - 1u) << 11);
+        float iw = InvWAt(uint(cand), y);
+        sx = uint(iw > bg * 1.15 + 1.0e-6 ? near : cand);
+      }
+    } else {
+      sx = key & 0xFFFu;
+    }
+    pc.outc.v[row + x] = pc.color.v[y * pc.W + sx];
+  }
+#endif
+}

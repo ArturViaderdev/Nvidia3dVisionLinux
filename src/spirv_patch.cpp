@@ -21,10 +21,14 @@ enum : uint32_t {
   OpLoad = 61, OpStore = 62, OpAccessChain = 65,
   OpDecorate = 71, OpMemberDecorate = 72, OpDecorationGroup = 73, OpGroupDecorate = 74,
   OpGroupMemberDecorate = 75,
-  OpCompositeExtract = 81, OpCompositeInsert = 82, OpConvertUToPtr = 120,
-  OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpLogicalAnd = 167, OpSelect = 169, OpFOrdNotEqual = 182,
-  OpFOrdLessThan = 184,
-  OpEmitVertex = 218, OpEmitStreamVertex = 220, OpReturn = 253,
+  OpCompositeExtract = 81, OpCompositeInsert = 82, OpUConvert = 113, OpConvertUToPtr = 120,
+  OpBitcast = 124, OpIAdd = 128,
+  OpFAdd = 129, OpFSub = 131, OpIMul = 132, OpFMul = 133, OpLogicalAnd = 167, OpSelect = 169, OpIEqual = 170,
+  OpFOrdNotEqual = 182, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186,
+  OpShiftRightLogical = 194, OpShiftLeftLogical = 196, OpBitwiseOr = 197, OpBitwiseXor = 198,
+  OpBitwiseAnd = 199,
+  OpEmitVertex = 218, OpEmitStreamVertex = 220,
+  OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253,
   OpModuleProcessed = 330, OpExecutionModeId = 331, OpDecorateId = 332,
   OpDecorateString = 5632, OpMemberDecorateString = 5633,
 };
@@ -118,7 +122,7 @@ bool HasPreRasterEntryPoint(const uint32_t* code, size_t n) {
 }
 
 PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, uint32_t execModel,
-                        uint64_t paramAddress, std::vector<uint32_t>& out, std::string* log) {
+                        uint64_t paramAddress, std::vector<uint32_t>& out, std::string* log, bool calib) {
   std::vector<Inst> insts;
   if (!ParseInsts(code, n, insts)) return PatchResult::Error;
   if (execModel != 0 && execModel != 2 && execModel != 3) return PatchResult::Unsupported;
@@ -241,6 +245,16 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
   uint32_t idMember = (posMember != UINT32_MAX) ? fresh() : 0;
 
   const bool isGeometry = (execModel == 3);
+  // projection samples: only at OpReturn sites (splitting a geometry shader's block around
+  // OpEmitVertex could break structured control flow)
+  if (isGeometry) calib = false;
+  uint32_t idC3 = fresh(), idHalf = fresh();
+  uint32_t idPtrU64 = 0, idK63 = 0, idK6 = 0, idK255 = 0, idK3 = 0, idK32 = 0, idOff64 = 0, idK7 = 0, idK18 = 0,
+           idK26 = 0, idKMul = 0;
+  if (calib) {
+    idPtrU64 = fresh(); idK63 = fresh(); idK6 = fresh(); idK255 = fresh(); idK3 = fresh(); idK32 = fresh();
+    idOff64 = fresh(); idK7 = fresh(); idK18 = fresh(); idK26 = fresh(); idKMul = fresh();
+  }
   int patchSites = 0;
 
   // --- emit -----------------------------------------------------------------------
@@ -268,13 +282,14 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
       Emit(out, OpMemberDecorate, {idStruct, 0, DecOffset, 0});
       Emit(out, OpMemberDecorate, {idStruct, 1, DecOffset, 4});
       Emit(out, OpMemberDecorate, {idStruct, 2, DecOffset, 8});
+      Emit(out, OpMemberDecorate, {idStruct, 3, DecOffset, 12});
     }
 
     if (ii == firstFunctionIdx) {
       if (addBool) Emit(out, OpTypeBool, {idBool});
       if (addU32) Emit(out, OpTypeInt, {idU32, 32, 0});
       if (addU64) Emit(out, OpTypeInt, {idU64, 64, 0});
-      Emit(out, OpTypeStruct, {idStruct, floatType, floatType, floatType});
+      Emit(out, OpTypeStruct, {idStruct, floatType, floatType, floatType, floatType});
       Emit(out, OpTypePointer, {idPtrStruct, StoragePhysicalStorageBuffer, idStruct});
       Emit(out, OpTypePointer, {idPtrFloat, StoragePhysicalStorageBuffer, floatType});
       if (idPtrOutVec4) Emit(out, OpTypePointer, {idPtrOutVec4, StorageOutput, vec4Type});
@@ -286,6 +301,21 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
       Emit(out, OpConstant, {floatType, idEdge, 0x3F7F7CEEu});  // 0.998 (x^2 limit for HUD vertices)
       if (idMember) Emit(out, OpConstant, {idU32, idMember, posMember});
       Emit(out, OpConstant, {floatType, idOne, 0x3F800000u});
+      Emit(out, OpConstant, {idU32, idC3, 3});
+      Emit(out, OpConstant, {floatType, idHalf, 0x3F000000u});
+      if (calib) {
+        Emit(out, OpTypePointer, {idPtrU64, StoragePhysicalStorageBuffer, idU64});
+        Emit(out, OpConstant, {idU32, idK63, 63});
+        Emit(out, OpConstant, {idU32, idK6, 6});
+        Emit(out, OpConstant, {idU32, idK255, kCalibSlots - 1});
+        Emit(out, OpConstant, {idU32, idK3, 3});
+        Emit(out, OpConstant, {idU32, idK32, 32});
+        Emit(out, OpConstant, {idU64, idOff64, kCalibOffset, 0});
+        Emit(out, OpConstant, {idU32, idK7, 7});
+        Emit(out, OpConstant, {idU32, idK18, 18});
+        Emit(out, OpConstant, {idU32, idK26, 26});
+        Emit(out, OpConstant, {idU32, idKMul, 0x9E3779B1u});
+      }
     }
 
     if (in.op == OpFunction) currentFunc = w[2];
@@ -333,6 +363,56 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
       Emit(out, OpSelect, {floatType, fx, persp, nx, hudx});
       Emit(out, OpCompositeInsert, {vec4Type, np, fx, p, 0});
       Emit(out, OpStore, {posPtr, np});
+      if (calib) {
+        // m = (bits(x) ^ (bits(y) >> 7) ^ bits(w) ^ (bits(z) >> 6)) * 0x9E3779B1
+        // if (params.flags > 0.5 && w != 1 && (m >> 26) == 0)            (1 vertex in 64)
+        //   slot[(m >> 18) & 255] = uint64(bits(w)) | (uint64(bits(z)) << 32)
+        uint32_t pf = fresh(), fl = fresh(), on = fresh(), wb = fresh(), lo = fresh(), loz = fresh(),
+                 c1 = fresh(), cond = fresh(), lStore = fresh(), lMerge = fresh();
+        Emit(out, OpAccessChain, {idPtrFloat, pf, ptrS, idC3});
+        Emit(out, OpLoad, {floatType, fl, pf, MemAligned, 4});
+        Emit(out, OpFOrdGreaterThan, {idBool, on, fl, idHalf});
+        // pick ~1/64 of the vertices (hash of x, y, w bits: varies even on flat geometry)
+        uint32_t xb = fresh(), yb = fresh(), h1 = fresh(), h2 = fresh(), hh = fresh(), zv = fresh(), zb = fresh(),
+                 zs = fresh();
+        Emit(out, OpBitcast, {idU32, wb, wv});
+        Emit(out, OpBitcast, {idU32, xb, x});
+        Emit(out, OpBitcast, {idU32, yb, y});
+        Emit(out, OpCompositeExtract, {floatType, zv, p, 2});
+        Emit(out, OpBitcast, {idU32, zb, zv});
+        Emit(out, OpShiftRightLogical, {idU32, zs, zb, idK6});
+        uint32_t ys = fresh(), h3 = fresh(), hm = fresh();
+        Emit(out, OpShiftRightLogical, {idU32, ys, yb, idK7});
+        Emit(out, OpBitwiseXor, {idU32, h1, xb, ys});
+        Emit(out, OpBitwiseXor, {idU32, h2, h1, wb});
+        Emit(out, OpBitwiseXor, {idU32, h3, h2, zs});
+        // multiply (golden ratio) and use the top bits: every input bit matters
+        Emit(out, OpIMul, {idU32, hm, h3, idKMul});
+        Emit(out, OpShiftRightLogical, {idU32, hh, hm, idK18});
+        Emit(out, OpShiftRightLogical, {idU32, lo, hm, idK26});
+        Emit(out, OpIEqual, {idBool, loz, lo, idC0});
+        Emit(out, OpLogicalAnd, {idBool, c1, on, persp});
+        Emit(out, OpLogicalAnd, {idBool, cond, c1, loz});
+        Emit(out, OpSelectionMerge, {lMerge, 0});
+        Emit(out, OpBranchConditional, {cond, lStore, lMerge});
+        Emit(out, OpLabel, {lStore});
+        uint32_t sh = fresh(), slot = fresh(), so = fresh(), so64 = fresh(),
+                 a1 = fresh(), a2 = fresh(), ptr = fresh(), w64 = fresh(), z64 = fresh(), zh = fresh(), val = fresh();
+        Emit(out, OpBitwiseAnd, {idU32, sh, hh, idK255});
+        Emit(out, OpBitwiseAnd, {idU32, slot, sh, idK255});
+        Emit(out, OpShiftLeftLogical, {idU32, so, slot, idK3});
+        Emit(out, OpUConvert, {idU64, so64, so});
+        Emit(out, OpIAdd, {idU64, a1, idAddr, idOff64});
+        Emit(out, OpIAdd, {idU64, a2, a1, so64});
+        Emit(out, OpConvertUToPtr, {idPtrU64, ptr, a2});
+        Emit(out, OpUConvert, {idU64, w64, wb});
+        Emit(out, OpUConvert, {idU64, z64, zb});
+        Emit(out, OpShiftLeftLogical, {idU64, zh, z64, idK32});
+        Emit(out, OpBitwiseOr, {idU64, val, w64, zh});
+        Emit(out, OpStore, {ptr, val, MemAligned, 8});
+        Emit(out, OpBranch, {lMerge});
+        Emit(out, OpLabel, {lMerge});
+      }
     }
 
     if (in.op == OpMemoryModel && w[1] == AddrLogical) {
