@@ -97,3 +97,12 @@ own_window = 0
 
 # 0 errores, 1 informacion, 2 detalle
 log_level = 1
+
+# Sombras de Unreal Engine y pasadas que reconstruyen la posicion desde la profundidad:
+# auto = corregir esos shaders en todos los juegos y no desplazar los mapas de sombras (16 bits)
+# en juegos de Unreal (*-Shipping.exe) | 1 = siempre las dos cosas | 0 = nada. Ctrl+Shift+Pausa compara.
+fix_shadows = auto
+
+# Guardar todos los shaders del juego (SPIR-V) en ~/.cache/3dvision/shaders/<juego> para
+# analizarlos (3dvision-tool shader-fix, 3dvision-shader-scan). Solo para diagnostico.
+dump_shaders = 0

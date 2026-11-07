@@ -19,6 +19,7 @@
 
 #include "../src/config.h"
 #include "../src/emitter.h"
+#include "../src/spirv_patch.h"
 
 using namespace stereo3d;
 
@@ -161,6 +162,59 @@ static int Test(double seconds, double hz) {
   return errors ? 1 : 0;
 }
 
+// shader-fix <folder of a shader dump>: which shaders the layer's fix_shadows would correct
+int ShaderFix(int argc, char** argv) {
+  std::string dir;
+  if (argc > 0) {
+    dir = argv[0];
+  } else {  // newest dump in ~/.cache/3dvision/shaders
+    const char* x = getenv("XDG_CACHE_HOME");
+    std::string base = (x && *x) ? std::string(x) + "/3dvision/shaders"
+                                 : std::string(getenv("HOME") ? getenv("HOME") : "") + "/.cache/3dvision/shaders";
+    time_t best = 0;
+    if (DIR* d = opendir(base.c_str())) {
+      while (dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        struct stat st;
+        std::string p = base + "/" + e->d_name;
+        if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && st.st_mtime >= best) { best = st.st_mtime; dir = p; }
+      }
+      closedir(d);
+    }
+  }
+  DIR* d = dir.empty() ? nullptr : opendir(dir.c_str());
+  if (!d) {
+    fprintf(stderr, "no shader dump (run the game with NV3D_DUMP_SHADERS=1)\n");
+    return 1;
+  }
+  std::vector<std::string> names;
+  while (dirent* e = readdir(d)) {
+    std::string n = e->d_name;
+    if (n.size() > 7 && (n.compare(n.size() - 7, 7, ".fs.spv") == 0 || n.compare(n.size() - 7, 7, ".cs.spv") == 0))
+      names.push_back(n);
+  }
+  closedir(d);
+  std::sort(names.begin(), names.end());
+  int fixed = 0;
+  for (const std::string& n : names) {
+    FILE* f = fopen((dir + "/" + n).c_str(), "rb");
+    if (!f) continue;
+    std::vector<uint32_t> code;
+    uint32_t w;
+    while (fread(&w, 4, 1, f) == 1) code.push_back(w);
+    fclose(f);
+    std::vector<uint32_t> out;
+    std::string log;
+    if (stereo3d::PatchScreenSpace(code.data(), code.size(), 0x100000ull, out, &log) == stereo3d::PatchResult::Patched) {
+      printf("  %s  %s\n", n.c_str(), log.c_str());
+      ++fixed;
+    }
+  }
+  printf("%s: %zu fragment/compute shaders, %d would be corrected by fix_shadows\n", dir.c_str(), names.size(),
+         fixed);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   Cfg().logLevel = 1;
   if (argc < 2) {
@@ -168,13 +222,15 @@ int main(int argc, char** argv) {
            "  3dvision-tool extract-fw <nvstusb.sys | folder> [-o out.fw]\n"
            "  3dvision-tool status\n"
            "  3dvision-tool upload\n"
-           "  3dvision-tool test [seconds=10] [hz=120]\n");
+           "  3dvision-tool test [seconds=10] [hz=120]\n"
+           "  3dvision-tool shader-fix [shader dump folder]   which shaders fix_shadows corrects\n");
     return 2;
   }
   std::string cmd = argv[1];
   if (cmd == "extract-fw") return ExtractFw(argc - 2, argv + 2);
   if (cmd == "status") return Status();
   if (cmd == "upload") return Upload();
+  if (cmd == "shader-fix") return ShaderFix(argc - 2, argv + 2);
   if (cmd == "test") return Test(argc > 2 ? atof(argv[2]) : 10.0, argc > 3 ? atof(argv[3]) : 120.0);
   fprintf(stderr, "unknown command %s\n", cmd.c_str());
   return 2;

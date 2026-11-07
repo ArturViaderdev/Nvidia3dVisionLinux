@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# 3dvision-shader-scan: finds, in the shaders saved with dump_shaders = 1, the screen-space passes that
+# rebuild a pixel's position from the depth buffer (Unreal Engine: shadow projection, deferred lights,
+# SSAO, reflections, fog...). Those passes break with the stereo shift and are the ones to correct.
+#
+#   3dvision-shader-scan                       newest folder in ~/.cache/3dvision/shaders
+#   3dvision-shader-scan DIR                   that folder
+#   3dvision-shader-scan DIR -v                + the instructions of each match
+#   3dvision-shader-scan DIR --dis HASH        disassembly of one shader (needs spirv-dis, spirv-tools)
+#
+# How: a data-flow pass over each fragment/compute shader (straight-line, per vector component)
+# tags values that come from the screen position (FragCoord, invocation id, varyings), from texture
+# reads and from uniform buffers.
+#   A  = (screen position x texture value) x uniform-only value: the Unreal pattern
+#        mul(float4(ScreenPos * SceneDepth, SceneDepth, 1), ScreenToWorld) and its relatives.
+#   B  = screen position x uniform  +  texture value x uniform in one sum: the SvPosition pattern
+#        mul(float4(SvPosition.xy, DeviceZ, 1), SVPositionToTranslatedWorld).
+# The uniform locations (descriptor set/binding[element]) of the matrices are listed: the same
+# location in many shaders is the engine's view matrix.
+import os
+import struct
+import subprocess
+import sys
+from collections import Counter, defaultdict
+
+S, T, U, P, M, SU, TU = 1, 2, 4, 8, 16, 32, 64
+VARYINGS = False  # --varyings: fragment inputs count as screen position too (passes that get it from the VS)
+
+# storage classes
+SC_UNIFORM_CONST, SC_INPUT, SC_UNIFORM, SC_OUTPUT, SC_PRIVATE, SC_FUNCTION = 0, 1, 2, 3, 6, 7
+SC_PUSH, SC_STORAGE, SC_PSB = 9, 12, 5349
+SCREEN_BUILTINS = {15, 26, 27, 28, 29}  # FragCoord, WorkgroupId, LocalInvocationId, GlobalInvocationId, LocalInvocationIndex
+IMAGE_OPS = set(range(87, 99)) | set(range(305, 316))  # sample / fetch / gather / read (+ sparse)
+ELEMENTWISE = {127, 129, 131, 133, 136, 137, 138, 139, 140, 141, 109, 110, 111, 112, 113, 114, 115, 116, 124, 169,
+               128, 130, 132, 134, 135, 126}  # negate, add, sub, mul, div, rem/mod, conversions, bitcast, select, int ops
+MUL_OPS = {133, 142, 144, 145, 148}  # FMul, VectorTimesScalar, VectorTimesMatrix, MatrixTimesVector, Dot
+# GLSL.std.450 instructions that work per component (all but length/distance/cross/normalize/...)
+EXT_NOT_ELEMENTWISE = {66, 67, 68, 69, 71}
+EXT_FMA = 50
+
+
+class Shader:
+    def __init__(self, words):
+        self.w = words
+        self.ops = []
+        i = 5
+        while i < len(words):
+            n = words[i] >> 16
+            if n == 0:
+                break
+            self.ops.append((words[i] & 0xFFFF, words[i + 1:i + n]))
+            i += n
+        self.types = {}       # id -> ('scalar'|'vec'|'mat'|'ptr'|'agg', info)
+        self.consts = {}
+        self.decor = defaultdict(dict)  # id -> {decoration: value}
+        self.names = {}
+        self.vars = {}        # id -> (storage class, pointee type)
+        self.stage = None
+        self.glsl_ext = None
+        for op, a in self.ops:
+            if op == 15 and self.stage is None:
+                self.stage = a[0]
+            elif op == 11:
+                if bytes(struct.pack("<%dI" % (len(a) - 1), *a[1:])).split(b"\0")[0] == b"GLSL.std.450":
+                    self.glsl_ext = a[0]
+            elif op == 5:
+                self.names[a[0]] = bytes(struct.pack("<%dI" % (len(a) - 1), *a[1:])).split(b"\0")[0].decode(
+                    "latin1")
+            elif op == 71 and len(a) >= 2:
+                self.decor[a[0]][a[1]] = a[2] if len(a) > 2 else True
+            elif op in (20, 21, 22):
+                self.types[a[0]] = ("scalar", 1)
+            elif op == 23:
+                self.types[a[0]] = ("vec", a[2])
+            elif op == 24:
+                self.types[a[0]] = ("mat", 1)
+            elif op in (28, 29, 30):
+                self.types[a[0]] = ("agg", 1)
+            elif op == 32:
+                self.types[a[0]] = ("ptr", (a[1], a[2]))
+            elif op == 43 and len(a) >= 3:
+                self.consts[a[1]] = a[2]
+            elif op == 59:
+                pt = self.types.get(a[0])
+                self.vars[a[1]] = (a[2], pt[1][1] if pt and pt[0] == "ptr" else None)
+
+    def ncomp(self, type_id):
+        t = self.types.get(type_id)
+        return t[1] if t and t[0] in ("vec", "scalar") else 1
+
+    def var_label(self, var):
+        d = self.decor.get(var, {})
+        nm = self.names.get(var, "")
+        if 34 in d or 33 in d:  # DescriptorSet / Binding
+            return "s%sb%s%s" % (d.get(34, "?"), d.get(33, "?"), ("(" + nm + ")") if nm else "")
+        if nm:
+            return nm
+        return {SC_PUSH: "push", SC_STORAGE: "ssbo"}.get(self.vars.get(var, (None,))[0], "u%d" % var)
+
+
+def scan(sh, verbose=False):
+    val = {}         # id -> [taint per component]
+    uloc = {}        # id -> set of uniform locations (for uniform-only values)
+    ptr = {}         # pointer id -> (var, component or None, uniform location)
+    mem = {}         # (var) -> [taint per component] for Function / Private variables
+    matches_a, matches_b, trail = [], [], []
+    images = Counter()
+    sampled = {}     # sampled image / image id -> variable
+    ext = sh.glsl_ext
+
+    def get(i, n=None):
+        v = val.get(i)
+        if v is None:
+            return [0] * (n or 1)
+        if n and len(v) != n:
+            if len(v) == 1:
+                return v * n
+            u = 0
+            for x in v:
+                u |= x
+            return [u] * n
+        return v
+
+    def union(vals):
+        u = 0
+        for v in vals:
+            for x in v:
+                u |= x
+        return u
+
+    def pure_u(t):
+        return (t & U) and not (t & (S | T | P))
+
+    def mul_tag(ta, tb, ia, ib):
+        """taint of a product: also detects the patterns"""
+        r = ta | tb
+        if (ta & S) and not (ta & T) and (tb & T) and not (tb & S):
+            r |= P
+        elif (tb & S) and not (tb & T) and (ta & T) and not (ta & S):
+            r |= P
+        for x, y, iy in ((ta, tb, ib), (tb, ta, ia)):
+            if (x & P) and pure_u(y):
+                r |= M
+                matches_a.append(iy)
+            if (x & S) and not (x & (T | P)) and pure_u(y):
+                r |= SU
+            if (x & T) and not (x & (S | P)) and pure_u(y):
+                r |= TU
+        return r
+
+    for op, a in sh.ops:
+        if op == 59:  # OpVariable
+            var, sc = a[1], a[2]
+            pt = sh.types.get(a[0])
+            n = sh.ncomp(pt[1][1]) if pt and pt[0] == "ptr" else 1
+            if sc in (SC_FUNCTION, SC_PRIVATE):
+                mem[var] = [0] * n
+            continue
+        if op in (65, 66, 67):  # OpAccessChain
+            base = a[2]
+            idx = a[3:]
+            if base in ptr:
+                bvar, bcomp, bloc = ptr[base]
+            else:
+                bvar, bcomp, bloc = base, None, None
+            sc = sh.vars.get(bvar, (None,))[0]
+            comp = None
+            if sc in (SC_FUNCTION, SC_PRIVATE) and idx and idx[-1] in sh.consts:
+                comp = sh.consts[idx[-1]]
+            loc = None
+            if sc in (SC_UNIFORM, SC_PUSH, SC_STORAGE, SC_UNIFORM_CONST):
+                parts = [str(sh.consts[x]) if x in sh.consts else "?" for x in idx]
+                loc = sh.var_label(bvar) + "".join("[%s]" % p for p in parts[-1:]) if parts else sh.var_label(bvar)
+                if bloc:
+                    loc = bloc
+            ptr[a[1]] = (bvar, comp, loc)
+            continue
+        if op == 61:  # OpLoad
+            rt, rid, p = a[0], a[1], a[2]
+            n = sh.ncomp(rt)
+            var, comp, loc = ptr.get(p, (p, None, None))
+            sc = sh.vars.get(var, (None,))[0]
+            d = sh.decor.get(var, {})
+            if sc == SC_INPUT:
+                t = S if (d.get(11) in SCREEN_BUILTINS or (VARYINGS and sh.stage == 4 and 30 in d)) else 0  # BuiltIn / Location
+                val[rid] = [t] * n
+            elif sc in (SC_UNIFORM, SC_PUSH, SC_STORAGE, SC_PSB):
+                val[rid] = [U] * n
+                uloc[rid] = {loc or sh.var_label(var)}
+            elif sc == SC_UNIFORM_CONST:
+                val[rid] = [0] * n
+                sampled[rid] = var
+            elif var in mem:
+                m = mem[var]
+                val[rid] = [m[comp]] * n if comp is not None and comp < len(m) else get_mem(m, n)
+            else:
+                val[rid] = [0] * n
+            continue
+        if op == 62:  # OpStore
+            p, v = a[0], a[1]
+            var, comp, _ = ptr.get(p, (p, None, None))
+            if var in mem:
+                m = mem[var]
+                vv = get(v)
+                if comp is not None and comp < len(m):
+                    m[comp] = union([vv])
+                elif len(vv) == len(m):
+                    mem[var] = list(vv)
+                else:
+                    mem[var] = [union([vv])] * len(m)
+            continue
+        if op in (86, 100):  # OpSampledImage / OpImage
+            sampled[a[1]] = sampled.get(a[2])
+            continue
+        if op in IMAGE_OPS:
+            rt, rid = a[0], a[1]
+            src = sampled.get(a[2])
+            images[sh.var_label(src) if src else "?"] += 1
+            val[rid] = [T] * sh.ncomp(rt)
+            continue
+        if len(a) < 2 or a[0] not in sh.types:
+            continue
+        rt, rid, ops_ = a[0], a[1], a[2:]
+        n = sh.ncomp(rt)
+        if op == 79:  # OpVectorShuffle
+            v1, v2 = get(ops_[0]), get(ops_[1])
+            both = v1 + v2
+            val[rid] = [both[c] if c < len(both) else 0 for c in ops_[2:]]
+            lu = uloc.get(ops_[0], set()) | uloc.get(ops_[1], set())
+            if lu:
+                uloc[rid] = lu
+        elif op == 81:  # OpCompositeExtract
+            v = get(ops_[0])
+            c = ops_[1] if len(ops_) > 1 else 0
+            val[rid] = [v[c] if c < len(v) else union([v])] * n
+            if ops_[0] in uloc:
+                uloc[rid] = uloc[ops_[0]]
+        elif op == 80:  # OpCompositeConstruct
+            out = []
+            for x in ops_:
+                out += get(x)
+            val[rid] = out[:n] if len(out) >= n else [union([out])] * n
+            lu = set()
+            for x in ops_:
+                lu |= uloc.get(x, set())
+            if lu:
+                uloc[rid] = lu
+        elif op == 82:  # OpCompositeInsert
+            obj, comp = get(ops_[0]), get(ops_[1], n)
+            out = list(comp)
+            if len(ops_) > 2 and ops_[2] < len(out):
+                out[ops_[2]] = union([obj])
+            val[rid] = out
+        elif op in MUL_OPS:
+            if op == 133:  # FMul, per component
+                va, vb = get(ops_[0], n), get(ops_[1], n)
+                val[rid] = [mul_tag(x, y, ops_[0], ops_[1]) for x, y in zip(va, vb)]
+            else:
+                # matrix x vector / dot: look at the vector's components one by one
+                # (DXVK turns mul(float4(...), Matrix) into dp4 with a constant-buffer row)
+                ia, ib = ops_[0], ops_[1]
+                ta, tb = union([get(ia)]), union([get(ib)])
+                if op == 145 or (op == 148 and pure_u(ta)):
+                    ia, ib, ta, tb = ib, ia, tb, ta  # ia = the vector, ib = the matrix / row
+                t = ta | tb
+                if pure_u(tb):
+                    comps = get(ia)
+                    if any(c & P for c in comps):
+                        t |= M
+                        matches_a.append(ib)
+                    elif any((c & S) and not (c & T) for c in comps) and any((c & T) and not (c & S) for c in comps):
+                        t |= SU | TU
+                        matches_b.append(ib)
+                    else:
+                        t = mul_tag(ta, tb, ia, ib)
+                else:
+                    t = mul_tag(ta, tb, ia, ib)
+                val[rid] = [t] * n
+        elif op == 12 and ops_ and ops_[0] == ext:  # GLSL.std.450
+            inst, args = ops_[1], ops_[2:]
+            if inst == EXT_FMA and len(args) == 3:
+                va, vb, vc = get(args[0], n), get(args[1], n), get(args[2], n)
+                val[rid] = [mul_tag(x, y, args[0], args[1]) | z for x, y, z in zip(va, vb, vc)]
+            elif inst in EXT_NOT_ELEMENTWISE:
+                val[rid] = [union([get(x) for x in args])] * n
+            else:
+                cols = [get(x, n) for x in args]
+                val[rid] = [union([[c[k]] for c in cols]) for k in range(n)] if cols else [0] * n
+            if all(x in uloc for x in args) and args:
+                uloc[rid] = set().union(*(uloc[x] for x in args))
+        elif op in ELEMENTWISE:
+            cols = [get(x, n) for x in ops_ if x in val]
+            val[rid] = [union([[c[k]] for c in cols]) for k in range(n)] if cols else [0] * n
+            lu = set()
+            for x in ops_:
+                lu |= uloc.get(x, set())
+            if lu:
+                uloc[rid] = lu
+        else:  # anything else (phi, calls, dot-like reductions...): union of every known operand
+            known = [get(x) for x in ops_ if x in val]
+            val[rid] = [union(known)] * n
+        t = union([val[rid]])
+        if (t & SU) and (t & TU) and op in (129, 12):
+            if not any((union([get(x)]) & (SU | TU)) == (SU | TU) for x in ops_ if x in val):
+                matches_b.append(rid)  # the sum where both halves meet (counted once)
+        if verbose and t & (M | P):
+            trail.append((op, rid, t))
+    return matches_a, matches_b, images, uloc, trail
+
+
+def get_mem(m, n):
+    if len(m) == n:
+        return list(m)
+    u = 0
+    for x in m:
+        u |= x
+    return [u] * n
+
+
+def newest_dump_dir():
+    base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "3dvision", "shaders")
+    if not os.path.isdir(base):
+        return None
+    dirs = [os.path.join(base, d) for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+    return max(dirs, key=os.path.getmtime) if dirs else None
+
+
+def read_pipelines(d):
+    info = defaultdict(list)
+    p = os.path.join(d, "pipelines.txt")
+    if os.path.isfile(p):
+        for line in open(p):
+            f = line.split()
+            kv = dict(x.split("=", 1) for x in f[1:] if "=" in x)
+            for k in ("fs", "cs"):
+                if k in kv:
+                    info[kv[k]].append(kv)
+    return info
+
+
+OPNAMES = {133: "FMul", 142: "VectorTimesScalar", 144: "VectorTimesMatrix", 145: "MatrixTimesVector",
+           148: "Dot", 129: "FAdd", 12: "ExtInst", 79: "Shuffle", 81: "Extract", 80: "Construct"}
+
+
+def main():
+    args = sys.argv[1:]
+    global VARYINGS
+    verbose = "-v" in args
+    VARYINGS = "--varyings" in args
+    args = [a for a in args if a not in ("-v", "--varyings")]
+    if "--dis" in args:
+        i = args.index("--dis")
+        h = args[i + 1]
+        rest = args[:i] + args[i + 2:]
+        d = rest[0] if rest else newest_dump_dir()
+        f = [x for x in os.listdir(d) if x.startswith(h)]
+        if not f:
+            sys.exit("no shader %s in %s" % (h, d))
+        sys.exit(subprocess.call(["spirv-dis", os.path.join(d, f[0])]))
+    d = args[0] if args else newest_dump_dir()
+    if not d or not os.path.isdir(d):
+        sys.exit("No hay shaders volcados. Arranca el juego con NV3D_DUMP_SHADERS=1 (o dump_shaders = 1 en su perfil).")
+    pipes = read_pipelines(d)
+    files = sorted(f for f in os.listdir(d) if f.endswith(".spv"))
+    stages = Counter(f.split(".")[1] for f in files)
+    print("%s: %d shaders (%s)" % (d, len(files), ", ".join("%s %d" % kv for kv in sorted(stages.items()))))
+    results, locs = [], Counter()
+    for f in files:
+        h, st = f.split(".")[0], f.split(".")[1]
+        if st not in ("fs", "cs"):
+            continue
+        data = open(os.path.join(d, f), "rb").read()
+        if len(data) < 20 or len(data) % 4:
+            continue
+        sh = Shader(list(struct.unpack("<%dI" % (len(data) // 4), data)))
+        try:
+            ma, mb, images, uloc, trail = scan(sh, verbose)
+        except (IndexError, KeyError, TypeError) as e:
+            print("  %s: no se pudo analizar (%s)" % (h, e))
+            continue
+        if not ma and not mb:
+            continue
+        mlocs = set()
+        for i in ma + mb:
+            mlocs |= uloc.get(i, set())
+        for loc in mlocs:
+            locs[loc] += 1
+        pl = pipes.get(h, [])
+        full = any(p.get("attribs") == "0" for p in pl)
+        results.append((len(ma), len(mb), h, st, sorted(mlocs), images, full, len(pl), trail, sh))
+    results.sort(key=lambda r: (-r[0], -r[1]))
+    print("\n%d shaders reconstruyen posiciones desde la pantalla y la profundidad:\n" % len(results))
+    print("  %-16s %-3s %4s %4s  %-11s %s" % ("shader", "", "A", "B", "pasada", "matriz (uniform) / texturas leidas"))
+    for na, nb, h, st, ml, images, full, npl, trail, sh in results:
+        kind = "compute" if st == "cs" else ("pant.compl." if full else ("%d pipel." % npl if npl else "-"))
+        print("  %-16s %-3s %4d %4d  %-11s %s" % (h, st, na, nb, kind, " ".join(ml[:6]) or "-"))
+        if verbose:
+            print("      texturas: %s" % ", ".join("%s x%d" % kv for kv in images.most_common(6)))
+            for op, rid, t in trail[:12]:
+                print("      %%%d = %s%s" % (rid, OPNAMES.get(op, "op%d" % op), "  <- MATRIZ" if t & M else ""))
+    if locs:
+        print("\nMatrices mas usadas (la de la vista del motor suele ser la primera):")
+        for loc, c in locs.most_common(8):
+            print("  %-30s en %d shaders" % (loc, c))
+
+
+if __name__ == "__main__":
+    main()

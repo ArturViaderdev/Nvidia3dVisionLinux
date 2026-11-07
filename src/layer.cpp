@@ -244,7 +244,11 @@ struct DeviceData {
 
   std::mutex shaderLock;
   std::unordered_map<VkShaderModule, ModuleEntry> modules;
-  std::atomic<uint32_t> patchedCount{0}, skippedCount{0}, pipelineCount{0}, depthOnlyCount{0};
+  std::unordered_map<VkShaderModule, uint64_t> moduleHash;  // dump_shaders: module -> dumped file
+  std::atomic<uint32_t> patchedCount{0}, skippedCount{0}, pipelineCount{0}, depthOnlyCount{0}, screenFixCount{0};
+  bool screenFix = false;    // fix_shadows: correct the screen-space position rebuilds (fragment/compute)
+  bool unshiftD16 = false;   // fix_shadows: 16-bit depth-only pipelines (Unreal shadow maps) unshifted
+  uint32_t lastFixLog[2] = {UINT32_MAX, UINT32_MAX};
 
   std::mutex swapLock;
   std::unordered_map<VkSwapchainKHR, Swapchain*> swapchains;
@@ -380,6 +384,15 @@ float EyeK(uint64_t frame) {
   float sign = (frame & 1) ? 1.0f : -1.0f;  // even frame = left eye
   if (c.swapEyes) sign = -sign;
   return sign * c.separation;
+}
+
+// params[4]: the screen-space corrections on (1) or off (0, Ctrl+Shift+Pause to compare)
+float ScreenFixFactor() { return (Cfg().fixShadows != 0 && Cfg().fixShadowsOn) ? 1.0f : 0.0f; }
+
+// Unreal Engine games ship as <Project>-Win64-Shipping.exe (also -WinGDK-, -Linux-...)
+bool IsUnrealGame() {
+  const std::string& g = GameName();
+  return g.size() > 13 && strcasecmp(g.c_str() + g.size() - 13, "-Shipping.exe") == 0;
 }
 
 uint32_t FindMemType(DeviceData* dd, uint32_t bits, VkMemoryPropertyFlags want,
@@ -1098,8 +1111,9 @@ bool CreateParamBuffer(DeviceData* dd) {
   dd->d.BindBufferMemory(dd->device, dd->paramBuf, dd->paramMem, 0);
   void* map = nullptr;
   if (dd->d.MapMemory(dd->device, dd->paramMem, 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS) {
-    float init[4] = {dd->depthMode ? 0.0f : EyeK(0), Cfg().convergence,
-                     (dd->depthMode || EyeK(0) == 0) ? 0.0f : HudFactor(), dd->depthMode ? 1.0f : 0.0f};
+    float init[5] = {dd->depthMode ? 0.0f : EyeK(0), Cfg().convergence,
+                     (dd->depthMode || EyeK(0) == 0) ? 0.0f : HudFactor(), dd->depthMode ? 1.0f : 0.0f,
+                     ScreenFixFactor()};
     memset(map, 0, 4096);
     memcpy(map, init, sizeof(init));
     dd->paramMap = map;  // stays mapped: the projection samples are read from it
@@ -1344,6 +1358,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice phys, const Vk
     dd->depthMode = wantDepth;
     dd->canCalib = wantDepth;
     dd->stereoShaders = CreateParamBuffer(dd);
+    // fix_shadows: screen-space rebuilds corrected in every game (the pattern is specific); shadow
+    // maps left unshifted by their 16-bit depth format only in Unreal Engine games (or fix_shadows = 1)
+    dd->screenFix = dd->stereoShaders && Cfg().fixShadows != 0;
+    dd->unshiftD16 = dd->screenFix && (Cfg().fixShadows == 1 || IsUnrealGame());
+    if (dd->unshiftD16) Log(1, "fix_shadows: Unreal Engine shadow maps (16-bit depth) without stereo shift");
     bool replay = dd->stereoShaders && Cfg().mode == 1;
     // replay starts after a warm-up in alternate: games that would hang at start in replay
     // (intros, shader compilation, loading screens that wait for the GPU) get going first
@@ -1733,14 +1752,192 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_BeginCommandBuffer(VkCommandBuffer cb, const
 }
 
 // ------------------------------------------------------------------------------------
+// Shader dump (dump_shaders = 1 / NV3D_DUMP_SHADERS=1): every SPIR-V module the game creates is saved
+// once as ~/.cache/3dvision/shaders/<game>/<hash>.<stage>.spv, and every pipeline as a line of
+// pipelines.txt (which shaders it joins, its vertex inputs and attachments). Offline material for
+// tools/3dvision-shader-scan (finding the screen-space passes that need a stereo correction).
+// ------------------------------------------------------------------------------------
+std::mutex g_dumpLock;
+std::unordered_set<uint64_t> g_dumped;
+std::unordered_set<std::string> g_dumpedPipes;
+std::string g_shaderDumpDir;
+
+const std::string& ShaderDumpDir() {
+  if (g_shaderDumpDir.empty()) {
+    std::string base;
+    if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) base = std::string(x) + "/3dvision";
+    else if (const char* h = getenv("HOME"); h && *h) base = std::string(h) + "/.cache/3dvision";
+    else base = "/tmp/3dvision";
+    std::string game = GameName().empty() ? "game" : GameName();
+    for (char& c : game)
+      if (c == '/' || c == ' ') c = '_';
+    std::string path;
+    for (const std::string& part : {base, base + "/shaders", base + "/shaders/" + game}) {
+      mkdir(part.c_str(), 0755);
+      path = part;
+    }
+    g_shaderDumpDir = path;
+    Log(1, "dump_shaders: saving shaders to %s", g_shaderDumpDir.c_str());
+  }
+  return g_shaderDumpDir;
+}
+
+const char* SpirvStageName(const uint32_t* code, size_t words) {
+  if (words < 5 || code[0] != 0x07230203) return "bad";
+  for (size_t i = 5; i < words;) {
+    uint32_t op = code[i] & 0xFFFF, n = code[i] >> 16;
+    if (n == 0) break;
+    if (op == 15 && i + 1 < words) {  // OpEntryPoint: the first one names the stage
+      static const char* kNames[] = {"vs", "tcs", "tes", "gs", "fs", "cs"};
+      uint32_t model = code[i + 1];
+      if (model < 6) return kNames[model];
+      if (model == 5267) return "task";
+      if (model == 5268) return "mesh";
+      return "other";
+    }
+    i += n;
+  }
+  return "none";
+}
+
+uint64_t DumpShader(const uint32_t* code, size_t words) {
+  uint64_t h = 1469598103934665603ull;  // FNV-1a over the words
+  for (size_t i = 0; i < words; ++i) {
+    h ^= code[i];
+    h *= 1099511628211ull;
+  }
+  std::lock_guard<std::mutex> l(g_dumpLock);
+  if (!g_dumped.insert(h).second) return h;
+  char name[64];
+  snprintf(name, sizeof(name), "/%016llx.%s.spv", (unsigned long long)h, SpirvStageName(code, words));
+  std::string path = ShaderDumpDir() + name;
+  if (FILE* f = fopen(path.c_str(), "wb")) {
+    fwrite(code, 4, words, f);
+    fclose(f);
+  }
+  return h;
+}
+
+void DumpPipelineLine(const std::string& line) {
+  std::lock_guard<std::mutex> l(g_dumpLock);
+  if (!g_dumpedPipes.insert(line).second) return;
+  std::string path = ShaderDumpDir() + "/pipelines.txt";
+  if (FILE* f = fopen(path.c_str(), "a")) {
+    fprintf(f, "%s\n", line.c_str());
+    fclose(f);
+  }
+}
+
+uint64_t StageHash(DeviceData* dd, const VkPipelineShaderStageCreateInfo& st) {
+  if (st.module != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> l(dd->shaderLock);
+    auto it = dd->moduleHash.find(st.module);
+    return it == dd->moduleHash.end() ? 0 : it->second;
+  }
+  for (auto* p = (const VkBaseInStructure*)st.pNext; p; p = p->pNext)
+    if (p->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+      auto* smci = (const VkShaderModuleCreateInfo*)p;
+      return DumpShader(smci->pCode, smci->codeSize / 4);
+    }
+  return 0;
+}
+
+void DumpGraphicsPipeline(DeviceData* dd, const VkGraphicsPipelineCreateInfo& ci) {
+  char buf[128];
+  std::string line = "G";
+  for (uint32_t s = 0; s < ci.stageCount; ++s) {
+    const VkPipelineShaderStageCreateInfo& st = ci.pStages[s];
+    const char* n = st.stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : st.stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fs"
+                  : st.stage == VK_SHADER_STAGE_GEOMETRY_BIT ? "gs" : st.stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
+                  ? "tes" : st.stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? "tcs" : "other";
+    snprintf(buf, sizeof(buf), " %s=%016llx", n, (unsigned long long)StageHash(dd, st));
+    line += buf;
+  }
+  // a full-screen pass has no vertex buffers (UE: lighting, shadow projection, post process)
+  uint32_t attribs = ci.pVertexInputState ? ci.pVertexInputState->vertexAttributeDescriptionCount : 0;
+  int depthTest = ci.pDepthStencilState ? int(ci.pDepthStencilState->depthTestEnable) : -1;
+  int depthWrite = ci.pDepthStencilState ? int(ci.pDepthStencilState->depthWriteEnable) : -1;
+  int colors = -1, depthFmt = -1;
+  if (ci.renderPass == VK_NULL_HANDLE) {
+    for (auto* p = (const VkBaseInStructure*)ci.pNext; p; p = p->pNext)
+      if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+        auto* r = (const VkPipelineRenderingCreateInfo*)p;
+        colors = int(r->colorAttachmentCount);
+        depthFmt = int(r->depthAttachmentFormat);
+      }
+  }
+  int blend = 0;
+  if (ci.pColorBlendState)
+    for (uint32_t k = 0; k < ci.pColorBlendState->attachmentCount; ++k)
+      blend |= ci.pColorBlendState->pAttachments[k].blendEnable ? 1 : 0;
+  snprintf(buf, sizeof(buf), " attribs=%u colors=%d depthfmt=%d ztest=%d zwrite=%d blend=%d", attribs, colors, depthFmt,
+           depthTest, depthWrite, blend);
+  line += buf;
+  DumpPipelineLine(line);
+}
+
+bool PatchCode(DeviceData* dd, const uint32_t* code, size_t words, uint32_t model, const char* entry,
+               std::vector<uint32_t>& out);
+VkShaderModule GetPatchedModule(DeviceData* dd, VkShaderModule m, uint32_t model, const char* entry);
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                           const VkComputePipelineCreateInfo* infos,
+                                                           const VkAllocationCallbacks* a, VkPipeline* out) {
+  DeviceData* dd = Dev(device);
+  if (Cfg().dumpShaders)
+    for (uint32_t i = 0; i < count; ++i) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "C cs=%016llx", (unsigned long long)StageHash(dd, infos[i].stage));
+      DumpPipelineLine(buf);
+    }
+  if (!dd->screenFix || !dd->stereoShaders) return dd->d.CreateComputePipelines(device, cache, count, infos, a, out);
+  // screen-space position rebuilds done in compute (tiled lighting, SSAO...)
+  std::vector<VkComputePipelineCreateInfo> ci(infos, infos + count);
+  struct Restore { VkShaderModuleCreateInfo* smci; const uint32_t* code; size_t size; };
+  std::vector<Restore> restores;
+  std::vector<std::unique_ptr<std::vector<uint32_t>>> inlineCode;
+  for (uint32_t i = 0; i < count; ++i) {
+    VkPipelineShaderStageCreateInfo& st = ci[i].stage;
+    if (st.stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+    if (st.module != VK_NULL_HANDLE) {
+      if (VkShaderModule pm = GetPatchedModule(dd, st.module, 5, st.pName)) st.module = pm;
+      continue;
+    }
+    for (auto* p = (VkBaseOutStructure*)st.pNext; p; p = p->pNext) {
+      if (p->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
+      auto* smci = (VkShaderModuleCreateInfo*)p;
+      auto buf = std::make_unique<std::vector<uint32_t>>();
+      if (PatchCode(dd, smci->pCode, smci->codeSize / 4, 5, st.pName, *buf)) {
+        restores.push_back({smci, smci->pCode, smci->codeSize});
+        smci->pCode = buf->data();
+        smci->codeSize = buf->size() * 4;
+        inlineCode.push_back(std::move(buf));
+      }
+      break;
+    }
+  }
+  VkResult r = dd->d.CreateComputePipelines(device, cache, count, ci.data(), a, out);
+  for (auto& rs : restores) {
+    rs.smci->pCode = rs.code;
+    rs.smci->codeSize = rs.size;
+  }
+  return r;
+}
+
+// ------------------------------------------------------------------------------------
 // Shader patching
 // ------------------------------------------------------------------------------------
 VKAPI_ATTR VkResult VKAPI_CALL hook_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* ci,
                                                        const VkAllocationCallbacks* a, VkShaderModule* m) {
   DeviceData* dd = Dev(device);
   VkResult r = dd->d.CreateShaderModule(device, ci, a, m);
+  if (r == VK_SUCCESS && Cfg().dumpShaders && ci->codeSize % 4 == 0) {
+    uint64_t h = DumpShader(ci->pCode, ci->codeSize / 4);
+    std::lock_guard<std::mutex> l(dd->shaderLock);
+    dd->moduleHash[*m] = h;
+  }
   if (r == VK_SUCCESS && dd->stereoShaders && ci->codeSize % 4 == 0 &&
-      HasPreRasterEntryPoint(ci->pCode, ci->codeSize / 4)) {
+      (dd->screenFix || HasPreRasterEntryPoint(ci->pCode, ci->codeSize / 4))) {
     std::lock_guard<std::mutex> l(dd->shaderLock);
     dd->modules[*m].code.assign(ci->pCode, ci->pCode + ci->codeSize / 4);
   }
@@ -1757,6 +1954,7 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyShaderModule(VkDevice device, VkShaderMod
         if (v.patched) dd->d.DestroyShaderModule(device, v.patched, nullptr);
       dd->modules.erase(it);
     }
+    dd->moduleHash.erase(m);
   }
   dd->d.DestroyShaderModule(device, m, a);
 }
@@ -1773,6 +1971,13 @@ uint32_t StageToModel(VkShaderStageFlagBits s) {
 bool PatchCode(DeviceData* dd, const uint32_t* code, size_t words, uint32_t model, const char* entry,
                std::vector<uint32_t>& out) {
   std::string log;
+  if (model == 4 || model == 5) {  // fragment / compute: screen-space position rebuilds
+    PatchResult pr = PatchScreenSpace(code, words, dd->paramAddr, out, &log);
+    if (pr != PatchResult::Patched) return false;
+    uint32_t n = ++dd->screenFixCount;
+    Log(1, "fix_shadows: %s shader #%u corrected (%s)", model == 4 ? "fragment" : "compute", n, log.c_str());
+    return true;
+  }
   PatchResult pr = PatchStereo(code, words, entry, model, dd->paramAddr, out, &log, dd->canCalib && dd->depthMode);
   if (pr == PatchResult::Patched) {
     uint32_t n = ++dd->patchedCount;
@@ -1806,6 +2011,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateGraphicsPipelines(VkDevice device, VkP
                                                             const VkGraphicsPipelineCreateInfo* infos,
                                                             const VkAllocationCallbacks* a, VkPipeline* out) {
   DeviceData* dd = Dev(device);
+  if (Cfg().dumpShaders)
+    for (uint32_t i = 0; i < count; ++i) DumpGraphicsPipeline(dd, infos[i]);
   if (!dd->stereoShaders) return dd->d.CreateGraphicsPipelines(device, cache, count, infos, a, out);
 
   std::vector<VkGraphicsPipelineCreateInfo> ci(infos, infos + count);
@@ -1814,62 +2021,77 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateGraphicsPipelines(VkDevice device, VkP
   std::vector<Restore> restores;
   std::vector<std::unique_ptr<std::vector<uint32_t>>> inlineCode;
 
+  // patches stage s of pipeline i (shader module or VK_KHR_maintenance5 inline code)
+  auto patchStage = [&](uint32_t i, uint32_t s, uint32_t model) {
+    const VkPipelineShaderStageCreateInfo& st = ci[i].pStages[s];
+    if (st.module != VK_NULL_HANDLE) {
+      VkShaderModule pm = GetPatchedModule(dd, st.module, model, st.pName);
+      if (pm) {
+        if (stages[i].empty()) {
+          stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
+          ci[i].pStages = stages[i].data();
+        }
+        stages[i][s].module = pm;
+      }
+      return;
+    }
+    for (auto* p = (VkBaseOutStructure*)st.pNext; p; p = p->pNext) {
+      if (p->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
+      auto* smci = (VkShaderModuleCreateInfo*)p;
+      auto buf = std::make_unique<std::vector<uint32_t>>();
+      if (PatchCode(dd, smci->pCode, smci->codeSize / 4, model, st.pName, *buf)) {
+        restores.push_back({smci, smci->pCode, smci->codeSize});
+        smci->pCode = buf->data();
+        smci->codeSize = buf->size() * 4;
+        inlineCode.push_back(std::move(buf));
+      }
+      break;
+    }
+  };
+
   for (uint32_t i = 0; i < count; ++i) {
     if (!ci[i].pStages || !ci[i].stageCount) continue;
-    int best = -1, bestRank = -1;
+    int best = -1, bestRank = -1, frag = -1;
     for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
       int rank = -1;
       switch (ci[i].pStages[s].stage) {
         case VK_SHADER_STAGE_VERTEX_BIT: rank = 0; break;
         case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: rank = 1; break;
         case VK_SHADER_STAGE_GEOMETRY_BIT: rank = 2; break;
+        case VK_SHADER_STAGE_FRAGMENT_BIT: frag = int(s); break;
         default: break;
       }
       if (rank > bestRank) { bestRank = rank; best = int(s); }
     }
     if (best < 0) continue;
+    // screen-space position rebuilds (Unreal shadow projection, lights...): see PatchScreenSpace
+    if (frag >= 0 && dd->screenFix) patchStage(i, uint32_t(frag), 4);
+
+    bool noColor = false;
+    int depthFmt = -1;
+    if (ci[i].renderPass == VK_NULL_HANDLE) {  // dynamic rendering: the attachment formats are in pNext
+      noColor = true;
+      for (auto* p = (const VkBaseInStructure*)ci[i].pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+          noColor = ((const VkPipelineRenderingCreateInfo*)p)->colorAttachmentCount == 0;
+          depthFmt = int(((const VkPipelineRenderingCreateInfo*)p)->depthAttachmentFormat);
+        }
+    }
     if (!Cfg().shiftShadows) {
       // depth-only pipelines (shadow maps...): no stereo shift. Shadow maps are seen from the light,
       // they must be the same for both eyes. (A depth pre-pass would also be skipped: per-game option.)
-      bool hasFrag = false;
-      for (uint32_t s2 = 0; s2 < ci[i].stageCount; ++s2) hasFrag |= ci[i].pStages[s2].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
-      bool noColor = false;
-      if (ci[i].renderPass == VK_NULL_HANDLE) {  // dynamic rendering: the attachment formats are in pNext
-        noColor = true;
-        for (auto* p = (const VkBaseInStructure*)ci[i].pNext; p; p = p->pNext)
-          if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
-            noColor = ((const VkPipelineRenderingCreateInfo*)p)->colorAttachmentCount == 0;
-      }
-      if (!hasFrag || noColor) {
+      if (frag < 0 || noColor) {
         ++dd->depthOnlyCount;
         continue;
       }
+    } else if (dd->unshiftD16 && noColor && depthFmt == VK_FORMAT_D16_UNORM) {
+      // Unreal Engine draws its shadow maps in 16-bit depth and the scene's depth pre-pass in
+      // D32S8 / D24S8: the shadow maps stay unshifted, the pre-pass keeps the stereo shift
+      ++dd->depthOnlyCount;
+      continue;
     }
     ++dd->pipelineCount;
-    const VkPipelineShaderStageCreateInfo& st = ci[i].pStages[best];
-    uint32_t model = StageToModel(st.stage);
-    if (st.module != VK_NULL_HANDLE) {
-      VkShaderModule pm = GetPatchedModule(dd, st.module, model, st.pName);
-      if (pm) {
-        stages[i].assign(ci[i].pStages, ci[i].pStages + ci[i].stageCount);
-        stages[i][best].module = pm;
-        ci[i].pStages = stages[i].data();
-      }
-    } else {
-      // VK_KHR_maintenance5: shader code chained inline
-      for (auto* p = (VkBaseOutStructure*)st.pNext; p; p = p->pNext) {
-        if (p->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
-        auto* smci = (VkShaderModuleCreateInfo*)p;
-        auto buf = std::make_unique<std::vector<uint32_t>>();
-        if (PatchCode(dd, smci->pCode, smci->codeSize / 4, model, st.pName, *buf)) {
-          restores.push_back({smci, smci->pCode, smci->codeSize});
-          smci->pCode = buf->data();
-          smci->codeSize = buf->size() * 4;
-          inlineCode.push_back(std::move(buf));
-        }
-        break;
-      }
-    }
+    patchStage(i, uint32_t(best), StageToModel(ci[i].pStages[best].stage));
   }
   VkResult r = dd->d.CreateGraphicsPipelines(device, cache, count, ci.data(), a, out);
   for (auto& rs : restores) {
@@ -2125,7 +2347,7 @@ bool WritePPM(DeviceData* dd, HostBuf& hb, VkFormat fmt, VkExtent2D e, const std
 
 void UpdateParams(DeviceData* dd, VkCommandBuffer cb, float k) {
   const VkPipelineStageFlags ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, XFER = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  float data[4] = {k, Cfg().convergence, HudFactor(), dd->depthMode ? 1.0f : 0.0f};
+  float data[5] = {k, Cfg().convergence, HudFactor(), dd->depthMode ? 1.0f : 0.0f, ScreenFixFactor()};
   VkMemoryBarrier pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER};  // after earlier reads and the previous update
   pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2898,6 +3120,15 @@ void LogStats(DeviceData* dd, Swapchain* sc, bool replayStats) {
   }
   double pairs = published >= sc->statPublished ? (published - sc->statPublished) / el : 0.0;
   sc->statPublished = published;
+  if (dd->screenFix) {  // only when something changed
+    uint32_t a = dd->screenFixCount.load(), b = dd->depthOnlyCount.load();
+    if (a != dd->lastFixLog[0] || b != dd->lastFixLog[1]) {
+      dd->lastFixLog[0] = a;
+      dd->lastFixLog[1] = b;
+      Log(1, "fix_shadows: %u shaders corrected, %u shadow-map pipelines unshifted (Ctrl+Shift+Pause: %s)", a, b,
+          Cfg().fixShadowsOn ? "on" : "off");
+    }
+  }
   if (replayStats) {
     uint32_t rf = dd->replayFrames.exchange(0), mf = dd->monoFrames.exchange(0);
     // the game needs GPU results in the middle of its frames: replay cannot work, use alternate
@@ -3777,6 +4008,9 @@ PFN_vkVoidFunction DeviceHook(const char* name) {
   }
   if (Cfg().mode == 2) {                 // depth mode: finds and copies the scene's depth buffer
     DEPTH_HOOKS(CHECK)
+  }
+  if (Cfg().dumpShaders || Cfg().fixShadows) {  // shader dump / screen-space fixes see the compute shaders
+    CHECK(CreateComputePipelines)
   }
   DEVICE_HOOKS(CHECK)
 #undef CHECK

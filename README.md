@@ -103,6 +103,7 @@ Either way the display always gets left, right, left, right… at the monitor's 
 | F10 | test pattern on/off |
 | F11 | capture: game image + left + right eye (PPM) |
 | F12 | start / stop recording a 3D video (full SBS) |
+| Pause | Unreal shadow corrections on/off (`fix_shadows`) |
 | Insert / Delete | shutter delay +25 / −25 µs |
 | End | shutter invert |
 | PgUp / PgDn / Home | zoom in / out / reset |
@@ -134,6 +135,20 @@ Emitter: wheel = separation, wheel with button pressed = convergence, button = 3
 
 `3dvision-tool status` checks the emitter outside games.
 
+## Unreal Engine shadows (`fix_shadows`)
+
+In Unreal Engine games the shadows (and other effects) are computed afterwards, in full-screen passes that rebuild each pixel's 3D position from the depth buffer with the camera's inverse matrix. That matrix knows nothing about the stereo shift, so each eye looked up the shadow in the wrong place (shifted or doubled shadows). Also, the shadow maps themselves were drawn shifted for each eye, although they are seen from the light. `fix_shadows` (on by default, `auto`) fixes both while the game runs:
+
+- **Screen-space rebuilds**: when the game creates a fragment or compute shader, the layer looks for the rebuild pattern (`ScreenPos.x × SceneDepth` then multiplied by a matrix together with the y term) and changes it to `ScreenPos.x × SceneDepth − k · (SceneDepth − convergence)`, undoing the shift of that eye. It is done before the driver compiles the shader, so there is no wrong frame and no cost while playing. The pattern is very specific (5 shaders of 457 in EDF World Brothers 2: its shadow projections), so it is active in every game.
+- **Shadow maps**: Unreal draws them in 16-bit depth and the scene's depth pre-pass in 32-bit, so 16-bit depth-only pipelines are left unshifted. Only in Unreal games (`*-Shipping.exe`) or with `fix_shadows = 1`.
+- **Ctrl+Shift+Pause** turns the corrections on/off in game to compare. The log says how many shaders were corrected (`fix_shadows: N shaders corrected...`). `fix_shadows = 0` disables everything.
+
+Tools to look into other games:
+
+1. `NV3D_DUMP_SHADERS=1 3dvision-run %command%` (or `dump_shaders = 1`) saves every shader once in `~/.cache/3dvision/shaders/<Game>/` (`<hash>.<stage>.spv` + `pipelines.txt`: shaders, vertex inputs, attachments and depth format of each pipeline).
+2. `3dvision-tool shader-fix [folder]` lists exactly the shaders `fix_shadows` corrects.
+3. `3dvision-shader-scan [folder] [-v] [--varyings]` is a wider search (any texture × screen position × uniform data) with the location of the matrices, to find other passes; `--dis <hash>` disassembles one (needs `spirv-tools`).
+
 ## How it works
 
 1. **Shader patching**: every vertex/tessellation/geometry shader shifts geometry by depth, `x += eye · separation · (w − convergence)`.
@@ -154,10 +169,12 @@ Emitter: wheel = separation, wheel with button pressed = convergence, button = 3
 src/layer.cpp          Vulkan layer: virtual swapchain, replay/alternate, stereo pairs, presenter thread
 src/emitter.cpp        3D Vision emitter (usbfs), firmware, vblank PLL and sync thread
 src/spirv_patch.cpp    SPIR-V patcher (stereo shift)
+src/spirv_screenfix.cpp  screen-space position rebuild correction (fix_shadows)
 src/config.cpp         configuration, profiles, logs, hotkeys
 src/output.cpp         optional own output window (X11)
-tools/3dvision-tool    firmware extraction, status, glasses test
+tools/3dvision-tool    firmware extraction, status, glasses test, shader-fix
 tools/3dvision-recorder  host side of the video recording (ffmpeg)
+tools/3dvision-shader-scan  finds screen-space position rebuilds in dumped shaders (Unreal shadows)
 tools/3dvision-run     launcher;  tools/set-120hz.sh  monitor mode
 udev/                  udev rule (install-udev.sh)
 tests/                 Vulkan test app, sync simulation
@@ -272,6 +289,7 @@ En los dos casos la pantalla recibe siempre izquierdo, derecho, izquierdo, derec
 | F10 | patrón de prueba sí/no |
 | F11 | captura: imagen del juego + ojo izquierdo + derecho (PPM) |
 | F12 | empezar / parar la grabación de un vídeo 3D (SBS completo) |
+| Pausa | correcciones de sombras de Unreal sí/no (`fix_shadows`) |
 | Insert / Supr | retardo del obturador +25 / −25 µs |
 | Fin | invertir obturador |
 | RePág / AvPág / Inicio | zoom más / menos / restablecer |
@@ -303,6 +321,20 @@ Emisor: rueda = separación, rueda con el botón pulsado = convergencia, botón 
 
 `3dvision-tool status` comprueba el emisor fuera de los juegos.
 
+## Sombras de Unreal Engine (`fix_shadows`)
+
+En los juegos de Unreal Engine las sombras (y otros efectos) se calculan después, en pasadas a pantalla completa que reconstruyen la posición 3D de cada píxel a partir de la profundidad con la matriz inversa de la cámara. Esa matriz no sabe nada del desplazamiento estéreo, así que cada ojo buscaba la sombra en el sitio equivocado (sombras corridas o dobles). Además, los propios mapas de sombras se dibujaban desplazados para cada ojo, aunque se ven desde la luz. `fix_shadows` (activado por defecto, `auto`) arregla las dos cosas mientras se juega:
+
+- **Reconstrucciones en pantalla**: cuando el juego crea un shader de fragmentos o de cómputo, la capa busca el patrón de la reconstrucción (`ScreenPos.x × SceneDepth` multiplicado después por una matriz junto con el término de y) y lo cambia por `ScreenPos.x × SceneDepth − k · (SceneDepth − convergencia)`, deshaciendo el desplazamiento de ese ojo. Se hace antes de que el driver compile el shader: ningún fotograma sale mal y no cuesta nada durante la partida. El patrón es muy concreto (5 shaders de 457 en EDF World Brothers 2: sus proyecciones de sombras), así que está activo en todos los juegos.
+- **Mapas de sombras**: Unreal los dibuja con profundidad de 16 bits y la pasada previa de profundidad de la escena con 32 bits, así que las pipelines solo de profundidad de 16 bits se quedan sin desplazar. Solo en juegos de Unreal (`*-Shipping.exe`) o con `fix_shadows = 1`.
+- **Ctrl+Shift+Pausa** activa/desactiva las correcciones en el juego para comparar. El registro dice cuántos shaders se han corregido (`fix_shadows: N shaders corrected...`). `fix_shadows = 0` lo desactiva todo.
+
+Herramientas para investigar otros juegos:
+
+1. `NV3D_DUMP_SHADERS=1 3dvision-run %command%` (o `dump_shaders = 1`) guarda cada shader una vez en `~/.cache/3dvision/shaders/<Juego>/` (`<hash>.<etapa>.spv` + `pipelines.txt`: shaders, entradas de vértices, adjuntos y formato de profundidad de cada pipeline).
+2. `3dvision-tool shader-fix [carpeta]` lista exactamente los shaders que corrige `fix_shadows`.
+3. `3dvision-shader-scan [carpeta] [-v] [--varyings]` es una búsqueda más amplia (cualquier textura × posición en pantalla × datos uniformes) con la ubicación de las matrices, para encontrar otras pasadas; `--dis <hash>` desensambla uno (necesita `spirv-tools`).
+
 ## Cómo funciona
 
 1. **Parcheo de shaders**: cada shader de vértices/teselación/geometría desplaza la geometría según la profundidad, `x += ojo · separación · (w − convergencia)`.
@@ -323,10 +355,12 @@ Emisor: rueda = separación, rueda con el botón pulsado = convergencia, botón 
 src/layer.cpp          capa Vulkan: swapchain virtual, replay/alternate, pares estéreo, hilo presentador
 src/emitter.cpp        emisor 3D Vision (usbfs), firmware, PLL del vblank e hilo de sincronización
 src/spirv_patch.cpp    parcheador SPIR-V (desplazamiento estéreo)
+src/spirv_screenfix.cpp  corrección de las reconstrucciones de posición en pantalla (fix_shadows)
 src/config.cpp         configuración, perfiles, registros, teclas
 src/output.cpp         ventana propia opcional (X11)
-tools/3dvision-tool    extracción de firmware, estado, prueba de gafas
+tools/3dvision-tool    extracción de firmware, estado, prueba de gafas, shader-fix
 tools/3dvision-recorder  parte del grabador de vídeo fuera del juego (ffmpeg)
+tools/3dvision-shader-scan  busca en los shaders volcados las reconstrucciones de posición (sombras de Unreal)
 tools/3dvision-run     lanzador;  tools/set-120hz.sh  modo del monitor
 udev/                  regla udev (install-udev.sh)
 tests/                 app de prueba Vulkan, simulación de la sincronización

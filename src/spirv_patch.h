@@ -27,6 +27,12 @@ PatchResult PatchStereo(const uint32_t* code, size_t wordCount, const char* entr
 // Quick scan: does this module contain an entry point that could need patching?
 bool HasPreRasterEntryPoint(const uint32_t* code, size_t wordCount);
 
+// Fragment / compute shaders: corrects the screen-space position rebuilds of deferred engines
+// (Unreal Engine shadow projection, lights...): ScreenPos.x * SceneW -= k * f * (SceneW - conv),
+// with k, conv, f = params[0], params[1], params[4]. NoPosition = nothing to correct.
+PatchResult PatchScreenSpace(const uint32_t* code, size_t wordCount, uint64_t paramAddress,
+                             std::vector<uint32_t>& out, std::string* log = nullptr);
+
 const char* PatchResultName(PatchResult r);
 
 }  // namespace stereo3d
