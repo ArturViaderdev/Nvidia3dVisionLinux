@@ -11,6 +11,8 @@
 #include "col.frag.h"
 #include "hud.vert.h"
 #include "scene.vert.h"
+#include "scene3d.frag.h"
+#include "scene3d.vert.h"
 #define CK(x) do { VkResult r_ = (x); if (r_ < 0) { fprintf(stderr, "FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(1); } } while (0)
 
 int main(int argc, char** argv) {
@@ -136,10 +138,40 @@ int main(int argc, char** argv) {
   VkShaderModule vsS = mod(spv_scene_vert, sizeof(spv_scene_vert));
   VkShaderModule vsH = mod(spv_hud_vert, sizeof(spv_hud_vert));
   VkShaderModule fs = mod(spv_col_frag, sizeof(spv_col_frag));
+  // APP_DEPTH=1: perspective scene with a depth buffer (for the depth / hybrid modes)
+  const bool depth = getenv("APP_DEPTH") && getenv("APP_DEPTH")[0] == '1';
+  VkShaderModule vs3 = mod(spv_scene3d_vert, sizeof(spv_scene3d_vert));
+  VkShaderModule fs3 = mod(spv_scene3d_frag, sizeof(spv_scene3d_frag));
+  const VkFormat dfmt = VK_FORMAT_D32_SFLOAT;
+  VkImage dimg = VK_NULL_HANDLE;
+  VkImageView dview = VK_NULL_HANDLE;
+  if (depth) {
+    VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ic.imageType = VK_IMAGE_TYPE_2D; ic.format = dfmt; ic.extent = {ext.width, ext.height, 1};
+    ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT;
+    ic.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    CK(vkCreateImage(dev, &ic, nullptr, &dimg));
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(dev, dimg, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    uint32_t mt = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if (mr.memoryTypeBits & (1u << i)) { mt = i; break; }
+    VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ma.allocationSize = mr.size; ma.memoryTypeIndex = mt;
+    VkDeviceMemory dm;
+    CK(vkAllocateMemory(dev, &ma, nullptr, &dm));
+    vkBindImageMemory(dev, dimg, dm, 0);
+    VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    v.image = dimg; v.viewType = VK_IMAGE_VIEW_TYPE_2D; v.format = dfmt;
+    v.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    CK(vkCreateImageView(dev, &v, nullptr, &dview));
+  }
   VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   VkPipelineLayout pl;
   CK(vkCreatePipelineLayout(dev, &plci, nullptr, &pl));
-  auto pipe = [&](VkShaderModule vs) {
+  auto pipe = [&](VkShaderModule vs, VkShaderModule fs, bool ztest) {
     VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
@@ -162,15 +194,19 @@ int main(int argc, char** argv) {
     dy.dynamicStateCount = 2; dy.pDynamicStates = ds;
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &viewFmt;
+    if (depth) ri.depthAttachmentFormat = dfmt;
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dss.depthTestEnable = ztest; dss.depthWriteEnable = ztest; dss.depthCompareOp = VK_COMPARE_OP_LESS;
     VkGraphicsPipelineCreateInfo g{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri};
     g.stageCount = 2; g.pStages = st; g.pVertexInputState = &vi; g.pInputAssemblyState = &ia;
     g.pViewportState = &vp; g.pRasterizationState = &rs; g.pMultisampleState = &ms;
     g.pColorBlendState = &cb; g.pDynamicState = &dy; g.layout = pl;
+    if (depth) g.pDepthStencilState = &dss;
     VkPipeline p;
     CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &g, nullptr, &p));
     return p;
   };
-  VkPipeline pScene = pipe(vsS), pHud = pipe(vsH);
+  VkPipeline pScene = depth ? pipe(vs3, fs3, true) : pipe(vsS, fs, false), pHud = pipe(vsH, fs, false);
 
   VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -205,17 +241,52 @@ int main(int argc, char** argv) {
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = imgs[idx]; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    if (depth) {
+      VkImageMemoryBarrier db{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      db.image = dimg; db.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+      vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+      da.imageView = dview; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      da.clearValue.depthStencil = {1.0f, 0};
+    }
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     ca.imageView = views[idx]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     ca.clearValue.color = {{0.1f, 0.1f, 0.1f, 1}};
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, ext}; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    if (depth) ri.pDepthAttachment = &da;
+    // APP_STAGES=1: a first pass with the far stage (the wall, another camera, many vertices), then
+    // the depth is cleared again for the near stage (the three quads)
+    static const bool stages = depth && getenv("APP_STAGES") && getenv("APP_STAGES")[0] == '1';
+    if (stages) {
+      vkCmdBeginRendering(cb, &ri);
+      VkViewport vp0{0, 0, float(ext.width), float(ext.height), 0, 1};
+      VkRect2D sc0{{0, 0}, ext};
+      vkCmdSetViewport(cb, 0, 1, &vp0); vkCmdSetScissor(cb, 0, 1, &sc0);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
+      for (int d = 0; d < 8; ++d) vkCmdDraw(cb, 6, 128, 0, 65536 + d * 128);
+      vkCmdEndRendering(cb);
+      ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // keep the colour, clear the depth
+    }
     vkCmdBeginRendering(cb, &ri);
-    VkViewport vp{0, 0, float(ext.width), float(ext.height), 0, 1};
+    static const float vmin = getenv("APP_VP_MIN") ? atof(getenv("APP_VP_MIN")) : 0.0f;  // test: depth range
+    VkViewport vp{0, 0, float(ext.width), float(ext.height), vmin, 1};
     VkRect2D sc{{0, 0}, ext};
     vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene); vkCmdDraw(cb, 18, 1, 0, 0);
+    // APP_MENU_AT=N: from frame N on only the HUD is drawn (a menu without 3D scene)
+    static const int menuAt = getenv("APP_MENU_AT") ? atoi(getenv("APP_MENU_AT")) : -1;
+    const bool menu = menuAt >= 0 && f >= menuAt;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
+    static const bool moving = getenv("APP_MOVE") && getenv("APP_MOVE")[0] == '1';
+    for (int d = 0; d < (menu ? 0 : depth ? 8 : 1); ++d) {
+      if (stages) vkCmdDraw(cb, 18, 32, 6, d * 32 + (moving ? f * 256 : 0));  // near stage: only the quads
+      else vkCmdDraw(cb, depth ? 24 : 18, depth ? 32 : 1, 0, depth ? d * 32 + (moving ? f * 256 : 0) : 0);
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pHud); vkCmdDraw(cb, 6, 1, 0, 0);
     vkCmdEndRendering(cb);
     b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;

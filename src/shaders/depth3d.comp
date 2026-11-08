@@ -1,7 +1,8 @@
 // 3dvisionlinux - depth mode: builds both eyes from one mono game frame and its depth buffer.
 // PASS 0 (splat): every game pixel is pushed to where it lands in each eye; the nearest wins.
 // PASS 1 (resolve): each eye pixel takes the colour of the game pixel that won it; holes
-//                   (background uncovered by the shift) take the farther neighbour.
+//                   (background uncovered by the shift) take the farther neighbour, or in hybrid
+//                   mode the last real image of that eye (rendered one frame ago from that eye).
 // Compile: glslangValidator -V --target-env vulkan1.2 -DPASS=0 depth3d.comp (see gen.sh)
 #version 450
 #extension GL_EXT_buffer_reference : require
@@ -10,7 +11,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32s { uint 
 layout(push_constant) uniform PC {
   U32s color;   // game image, W*H 32-bit pixels
   U32s depth;   // raw depth copy (Dw*Dh texels)
-  U32s keys;    // 2*W*H: winner per eye pixel ((nearness+1) << 12 | source x), 0 = empty
+  U32s keys;    // 2*W*H: winner per eye pixel ((nearness+1) << 13 | centre << 12 | source x), 0 = empty
   U32s outc;    // 2*W*H: eye images
   U32s meta;    // [0] Dw [1] Dh [2] format 0 f32, 1 unorm24, 2 unorm16 [3] copies
   uint W, H;
@@ -18,7 +19,16 @@ layout(push_constant) uniform PC {
   float kL, kR; // per-eye shift at infinity (NDC); 0 = 2D
   float conv;   // depth (game units) on the screen plane
   float maxShift;
+  U32s prev;    // hybrid: 2*W*H last real image of each eye
+  uint hyb;     // hybrid: bit 0 prev of the rebuilt eye valid, bit 1 prev of the real eye valid,
+                // bit 4 = the real eye (the colour image belongs to it)
 } pc;
+
+// colour unchanged (per 8-bit channel) between this frame and the previous real image of the same eye
+bool Same(uint a, uint b) {
+  uvec4 d = uvec4(abs(ivec4(unpackUnorm4x8(a) * 255.0) - ivec4(unpackUnorm4x8(b) * 255.0)));
+  return max(max(d.x, d.y), max(d.z, d.w)) <= 6u;
+}
 
 float DepthAt(uint idx, uint fmt) {
   if (fmt == 2u) {
@@ -58,14 +68,19 @@ void main() {
     invW = min(invW, 1.0e30);
   }
   float base = 1.0 - pc.conv * invW;
-  uint key = (((floatBitsToUint(invW) >> 11) + 1u) << 12) | x;
+  uint key = (((floatBitsToUint(invW) >> 12) + 1u) << 13) | x;
   for (uint e = 0u; e < 2u; ++e) {
     float k = e == 0u ? pc.kL : pc.kR;
     float shift = have ? clamp(k * base * float(pc.W) * 0.5, -pc.maxShift, pc.maxShift) : 0.0;
+    // the pixel goes to the two eye pixels around its shifted position (no cracks where the image
+    // stretches); the one that holds its centre has priority, so there is no half-pixel bias
+    // (hybrid mode alternates real and rebuilt images in each eye: a bias would shimmer)
     int i0 = int(floor(float(x) + shift));
+    int ic = int(floor(float(x) + 0.5 + shift));
     for (int j = 0; j < 2; ++j) {
       int xi = i0 + j;
-      if (xi >= 0 && xi < int(pc.W)) atomicMax(pc.keys.v[e * WH + y * pc.W + uint(xi)], key);
+      uint kk = key | (xi == ic ? 4096u : 0u);
+      if (xi >= 0 && xi < int(pc.W)) atomicMax(pc.keys.v[e * WH + y * pc.W + uint(xi)], kk);
     }
   }
 #else
@@ -80,10 +95,32 @@ void main() {
     pc.outc.v[WH + y * pc.W + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
     return;
   }
+  // hybrid: what did not move on screen since the last real image of the real eye (HUD, text,
+  // the player followed by the camera, a still scene) is taken from the last real image of the
+  // rebuilt eye instead of being rebuilt: each eye alternates real and rebuilt images, and
+  // anything the depth places wrongly (no depth: HUD; other depth ranges) would jump between them
+  uint realE = (pc.hyb >> 4) & 1u;
+  bool still = false;
+  if ((pc.hyb & 3u) == 3u) {
+    still = true;
+    for (int o = -1; o <= 1 && still; ++o) {
+      uint xx = uint(clamp(int(x) + o, 0, int(pc.W) - 1));
+      still = Same(pc.color.v[y * pc.W + xx], pc.prev.v[realE * WH + y * pc.W + xx]);
+    }
+  }
   for (uint e = 0u; e < 2u; ++e) {
     uint row = e * WH + y * pc.W;
+    if (still && e != realE) {
+      pc.outc.v[row + x] = pc.prev.v[row + x];
+      continue;
+    }
     uint key = pc.keys.v[row + x];
     uint sx = x;
+    if (key == 0u && (pc.hyb & 1u) != 0u) {
+      // hybrid: the uncovered background was really seen by this eye one frame ago
+      pc.outc.v[row + x] = pc.prev.v[row + x];
+      continue;
+    }
     if (key == 0u) {
       // A hole: background uncovered next to a nearer object that moved. The real content is not
       // in the image; continue the background by mirroring it across the edge (keeps its texture,
@@ -91,7 +128,7 @@ void main() {
       uint kl = 0u, kr = 0u, rl = 0u, rr = 0u;
       for (uint r = 1u; r <= 96u && kl == 0u && r <= x; ++r) { kl = pc.keys.v[row + x - r]; rl = r; }
       for (uint r = 1u; r <= 96u && kr == 0u && x + r < pc.W; ++r) { kr = pc.keys.v[row + x + r]; rr = r; }
-      bool left = kl != 0u && (kr == 0u || (kl >> 12) < (kr >> 12));
+      bool left = kl != 0u && (kr == 0u || (kl >> 13) < (kr >> 13));
       uint k2 = left ? kl : kr;
       if (k2 != 0u) {
         int edge = int(k2 & 0xFFFu);
@@ -100,7 +137,7 @@ void main() {
         near = clamp(near, 0, int(pc.W) - 1);
         cand = clamp(cand, 0, int(pc.W) - 1);
         // the mirrored pixel must be background too, not another near object
-        float bg = uintBitsToFloat(((k2 >> 12) - 1u) << 11);
+        float bg = uintBitsToFloat(((k2 >> 13) - 1u) << 12);
         float iw = InvWAt(uint(cand), y);
         sx = uint(iw > bg * 1.15 + 1.0e-6 ? near : cand);
       }

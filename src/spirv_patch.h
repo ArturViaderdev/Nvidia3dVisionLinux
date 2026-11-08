@@ -19,7 +19,8 @@ enum class PatchResult { Patched, NoPosition, NoEntryPoint, Unsupported, Error }
 // buffer (slots at paramAddress + kCalibOffset, 8 bytes each) while params[3] > 0.5, so the layer
 // can recover the projection's depth mapping (needs vertexPipelineStoresAndAtomics).
 constexpr uint32_t kCalibOffset = 64;
-constexpr uint32_t kCalibSlots = 256;
+constexpr uint32_t kCalibSlots = 256;   // 4 groups of 64 (params.flags = 1 + group)
+constexpr uint32_t kCalibGroupSlots = 64;
 PatchResult PatchStereo(const uint32_t* code, size_t wordCount, const char* entryName,
                         uint32_t execModel, uint64_t paramAddress,
                         std::vector<uint32_t>& out, std::string* log = nullptr, bool calib = false);

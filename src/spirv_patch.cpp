@@ -21,8 +21,8 @@ enum : uint32_t {
   OpLoad = 61, OpStore = 62, OpAccessChain = 65,
   OpDecorate = 71, OpMemberDecorate = 72, OpDecorationGroup = 73, OpGroupDecorate = 74,
   OpGroupMemberDecorate = 75,
-  OpCompositeExtract = 81, OpCompositeInsert = 82, OpUConvert = 113, OpConvertUToPtr = 120,
-  OpBitcast = 124, OpIAdd = 128,
+  OpCompositeExtract = 81, OpCompositeInsert = 82, OpConvertFToU = 109, OpUConvert = 113, OpConvertUToPtr = 120,
+  OpBitcast = 124, OpIAdd = 128, OpISub = 130,
   OpFAdd = 129, OpFSub = 131, OpIMul = 132, OpFMul = 133, OpLogicalAnd = 167, OpSelect = 169, OpIEqual = 170,
   OpFOrdNotEqual = 182, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186,
   OpShiftRightLogical = 194, OpShiftLeftLogical = 196, OpBitwiseOr = 197, OpBitwiseXor = 198,
@@ -398,8 +398,16 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
         Emit(out, OpLabel, {lStore});
         uint32_t sh = fresh(), slot = fresh(), so = fresh(), so64 = fresh(),
                  a1 = fresh(), a2 = fresh(), ptr = fresh(), w64 = fresh(), z64 = fresh(), zh = fresh(), val = fresh();
-        Emit(out, OpBitwiseAnd, {idU32, sh, hh, idK255});
-        Emit(out, OpBitwiseAnd, {idU32, slot, sh, idK255});
+        // slot = group * 64 + hash (64 slots per group): params.flags = 1 + group, the group being
+        // the number of times the scene depth was cleared so far in the frame (scenes drawn in
+        // several stages with different cameras: only the last stage is in the depth copy)
+        uint32_t g = fresh(), g1 = fresh(), g2 = fresh(), gs = fresh();
+        Emit(out, OpBitwiseAnd, {idU32, sh, hh, idK63});
+        Emit(out, OpConvertFToU, {idU32, g, fl});
+        Emit(out, OpISub, {idU32, g1, g, idC1});
+        Emit(out, OpBitwiseAnd, {idU32, g2, g1, idK3});
+        Emit(out, OpShiftLeftLogical, {idU32, gs, g2, idK6});
+        Emit(out, OpBitwiseOr, {idU32, slot, gs, sh});
         Emit(out, OpShiftLeftLogical, {idU32, so, slot, idK3});
         Emit(out, OpUConvert, {idU64, so64, so});
         Emit(out, OpIAdd, {idU64, a1, idAddr, idOff64});

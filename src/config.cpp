@@ -79,7 +79,7 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "game_sync") && ParseBool(val, b)) g_cfg.gameSync = b;
   else if (!strcmp(key, "own_window") && ParseBool(val, b)) g_cfg.ownWindow = b ? 1 : 0;
   else if (!strcmp(key, "mode"))
-    g_cfg.mode = !strcasecmp(val, "replay") ? 1 : !strcasecmp(val, "depth") ? 2 : 0;
+    g_cfg.mode = !strcasecmp(val, "replay") ? 1 : !strcasecmp(val, "depth") ? 2 : !strcasecmp(val, "hybrid") ? 3 : 0;
   else if (!strcmp(key, "replay_warmup") && ParseFloat(val, f)) g_cfg.replayWarmup = std::max(0.0f, f);
   else if (!strcmp(key, "crop")) {
     if (!strcasecmp(val, "auto")) g_cfg.crop = -1;
@@ -198,7 +198,9 @@ static void LoadEnv() {
   if (const char* v = getenv("NV3D_DELAY")) ApplyKey("emitter_delay_us", v);
 }
 
-const char* ModeName(int mode) { return mode == 1 ? "replay" : mode == 2 ? "depth" : "alternate"; }
+const char* ModeName(int mode) {
+  return mode == 1 ? "replay" : mode == 2 ? "depth" : mode == 3 ? "hybrid" : "alternate";
+}
 
 void LoadConfig() {
   static bool loaded = false;

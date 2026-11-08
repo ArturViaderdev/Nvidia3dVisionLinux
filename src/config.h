@@ -18,6 +18,7 @@ struct Config {
   int ownWindow = 0;           // 0 present on the game window (default), 1 own full-screen window
   int mode = 1;                // 1 replay (both eyes every game frame, default), 0 alternate (L/R frames),
                                // 2 depth (one game frame -> both eyes, rebuilt from the depth buffer)
+                               // 3 hybrid (alternate L/R frames; each one also gives the other eye from its depth)
   float replayWarmup = 8.0f;   // replay: seconds of alternate at start (intros, shader compilation)
   float fpsLimit = 0.0f;       // extra game fps cap (pairs per second in replay). 0 = only the display sync
   bool gameSync = true;        // the game waits for the display (no frames rendered just to be dropped)

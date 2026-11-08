@@ -24,6 +24,9 @@ stereo = 1
 #  alternate = un fotograma para cada ojo; el juego necesita ir a 120 fps para 60 por ojo.
 #  depth     = un fotograma normal del juego -> los dos ojos, reconstruidos con el buffer de
 #              profundidad. Para juegos limitados a 60 fps que no admiten replay (60 por ojo).
+#  hybrid    = como alternate (un ojo real por fotograma) y el otro ojo reconstruido con la
+#              profundidad; los huecos se rellenan con la ultima imagen real de ese ojo y los
+#              menus sin escena 3D se ven como en alternate. Menos defectos que depth (60 por ojo).
 mode = replay
 
 # Segundos en alternate al arrancar antes de pasar a replay (intros, carga de shaders). 0 = no

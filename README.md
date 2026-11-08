@@ -65,7 +65,7 @@ Steam → game properties → General → Launch options:
 | Case | Add in front |
 |---|---|
 | Games that read back from the GPU every frame (EDF5/EDF6), emulators | `NV3D_MODE=alternate` |
-| Those games when they are capped at 60 fps (30 per eye in alternate) | `NV3D_MODE=depth` |
+| Those games when they are capped at 60 fps (30 per eye in alternate) | `NV3D_MODE=hybrid` (or `depth`) |
 | Force replay without automatic fallback | `NV3D_MODE=replay NV3D_AUTO_SWITCH=0` |
 | Sync / ghosting test pattern from the start | `NV3D_TEST_PATTERN=1` |
 | Vulkan 1.0 apps (older native games) | `NV3D_LEGACY=1` |
@@ -84,7 +84,8 @@ In-game settings: **1920x1080 fullscreen**, **no TAA/DLSS/FSR2+/frame generation
 
 - **replay** (default): the game renders each frame once; the layer submits the same commands again with the other eye's camera. A game at 60 fps gives **60 fps per eye** with both eyes at the same instant. Twice the GPU work. If the game needs GPU results mid-frame, those frames are 2D and the layer falls back to alternate by itself.
 - **alternate**: one game frame per eye; the game must run at 120 fps for 60 per eye.
-- **depth**: for games that cannot use replay and are capped at 60 fps (alternate would give 30 per eye). The game renders one normal image per frame; the layer copies the scene's depth buffer right after the main pass and rebuilds **both eyes** from the image and the depth (60 fps per eye). It also learns how the game's depth maps to distance from samples stored by the patched shaders, so convergence works in the game's units as in the other modes. Limits: small halos where the background is uncovered next to near objects, and the HUD takes the depth of what is behind it. Needs DXVK / VKD3D-Proton (dynamic rendering); the log says when a game is not supported.
+- **depth**: for games that cannot use replay and are capped at 60 fps (alternate would give 30 per eye). The game renders one normal image per frame; the layer copies the scene's depth buffer right after the main pass and rebuilds **both eyes** from the image and the depth (60 fps per eye). It also learns how the game's depth maps to distance from samples stored by the patched shaders, so convergence works in the game's units as in the other modes. Limits: small halos where the background is uncovered next to near objects, and the HUD takes the depth of what is behind it. Needs DXVK / VKD3D-Proton (dynamic rendering); the log says when a game is not supported. Frames that draw no 3D scene (menus, loading screens) are shown in 2D instead of being warped by an old depth buffer.
+- **hybrid**: alternate and depth together, for the same games (60 fps cap, no replay). Each game frame is rendered for one eye with the real stereo geometry, as in alternate, and the **other eye is rebuilt from that frame's depth**: 60 fps per eye. Half of the images shown are real, and the background uncovered next to near objects comes from the last real image of that eye (one frame old, seen from the right place) instead of being invented: far fewer halos than depth. Menus and loading screens without a 3D scene are shown exactly as in alternate. The HUD over the 3D scene is still warped in the rebuilt eye. Same requirements as depth.
 
 Replay starts after a **warm-up** of `replay_warmup` seconds (default 8) in alternate: intros, shader compilation and loading screens that would hang in replay get going first (`NV3D_REPLAY_WARMUP=0` disables it).
 
@@ -177,7 +178,7 @@ tools/3dvision-recorder  host side of the video recording (ffmpeg)
 tools/3dvision-shader-scan  finds screen-space position rebuilds in dumped shaders (Unreal shadows)
 tools/3dvision-run     launcher;  tools/set-120hz.sh  monitor mode
 udev/                  udev rule (install-udev.sh)
-tests/                 Vulkan test app, sync simulation
+tests/                 Vulkan test app (APP_DEPTH=1: 3D scene with depth, APP_MOVE=1, APP_STAGES=1: far/near cameras, APP_MENU_AT=N), sync simulation
 ```
 
 License note: the emitter firmware belongs to NVIDIA and is never included; you extract it from your own copy of the driver.
@@ -251,7 +252,7 @@ Steam → propiedades del juego → General → Opciones de lanzamiento:
 | Caso | Añadir delante |
 |---|---|
 | Juegos que leen de la GPU en cada fotograma (EDF5/EDF6), emuladores | `NV3D_MODE=alternate` |
-| Esos juegos cuando están limitados a 60 fps (30 por ojo en alternate) | `NV3D_MODE=depth` |
+| Esos juegos cuando están limitados a 60 fps (30 por ojo en alternate) | `NV3D_MODE=hybrid` (o `depth`) |
 | Forzar replay sin cambio automático | `NV3D_MODE=replay NV3D_AUTO_SWITCH=0` |
 | Patrón de prueba de sincronización / fantasma desde el inicio | `NV3D_TEST_PATTERN=1` |
 | Apps Vulkan 1.0 (juegos nativos antiguos) | `NV3D_LEGACY=1` |
@@ -270,7 +271,8 @@ Ajustes del juego: **1920x1080 pantalla completa**, **sin TAA/DLSS/FSR2+/generac
 
 - **replay** (por defecto): el juego dibuja cada fotograma una vez y la capa vuelve a enviar los mismos comandos con la cámara del otro ojo. Un juego a 60 fps da **60 fps por ojo** y los dos ojos ven el mismo instante. Doble trabajo para la GPU. Si el juego necesita resultados de la GPU a mitad de fotograma, esos fotogramas salen en 2D y la capa pasa sola a alternate.
 - **alternate**: un fotograma del juego por ojo; el juego necesita 120 fps para 60 por ojo.
-- **depth**: para juegos que no pueden usar replay y están limitados a 60 fps (en alternate darían 30 por ojo). El juego dibuja una imagen normal por fotograma; la capa copia el búfer de profundidad de la escena justo después del pase principal y reconstruye **los dos ojos** a partir de la imagen y la profundidad (60 fps por ojo). Aprende cómo se traduce la profundidad del juego a distancia con muestras que guardan los shaders parcheados, así que la convergencia va en las mismas unidades que en los otros modos. Límites: pequeños halos donde se destapa el fondo junto a objetos cercanos, y el HUD toma la profundidad de lo que tiene detrás. Necesita DXVK / VKD3D-Proton (dynamic rendering); el log avisa si un juego no es compatible.
+- **depth**: para juegos que no pueden usar replay y están limitados a 60 fps (en alternate darían 30 por ojo). El juego dibuja una imagen normal por fotograma; la capa copia el búfer de profundidad de la escena justo después del pase principal y reconstruye **los dos ojos** a partir de la imagen y la profundidad (60 fps por ojo). Aprende cómo se traduce la profundidad del juego a distancia con muestras que guardan los shaders parcheados, así que la convergencia va en las mismas unidades que en los otros modos. Límites: pequeños halos donde se destapa el fondo junto a objetos cercanos, y el HUD toma la profundidad de lo que tiene detrás. Necesita DXVK / VKD3D-Proton (dynamic rendering); el log avisa si un juego no es compatible. Los fotogramas sin escena 3D (menús, pantallas de carga) se ven en 2D en vez de deformarse con una profundidad antigua.
+- **hybrid**: alternate y depth a la vez, para los mismos juegos (limitados a 60 fps, sin replay). Cada fotograma del juego se dibuja para un ojo con la geometría estéreo real, como en alternate, y el **otro ojo se reconstruye con la profundidad de ese fotograma**: 60 fps por ojo. La mitad de las imágenes que ves son reales, y el fondo que se destapa junto a objetos cercanos sale de la última imagen real de ese ojo (de hace un fotograma y vista desde el sitio correcto) en vez de inventarse: muchos menos halos que en depth. Los menús y pantallas de carga sin escena 3D se ven exactamente como en alternate. El HUD sobre la escena 3D sigue deformándose en el ojo reconstruido. Mismos requisitos que depth.
 
 El modo replay empieza tras un **calentamiento** de `replay_warmup` segundos (8 por defecto) en alternate: las intros, la compilación de shaders y las pantallas de carga que se colgarían en replay arrancan primero (`NV3D_REPLAY_WARMUP=0` lo desactiva).
 
@@ -363,7 +365,7 @@ tools/3dvision-recorder  parte del grabador de vídeo fuera del juego (ffmpeg)
 tools/3dvision-shader-scan  busca en los shaders volcados las reconstrucciones de posición (sombras de Unreal)
 tools/3dvision-run     lanzador;  tools/set-120hz.sh  modo del monitor
 udev/                  regla udev (install-udev.sh)
-tests/                 app de prueba Vulkan, simulación de la sincronización
+tests/                 app de prueba Vulkan (APP_DEPTH=1: escena 3D con profundidad, APP_MOVE=1, APP_STAGES=1: cámara lejana/cercana, APP_MENU_AT=N), simulación de la sincronización
 ```
 
 Nota de licencia: el firmware del emisor es de NVIDIA y nunca se incluye; lo extraes de tu propia copia del driver.
