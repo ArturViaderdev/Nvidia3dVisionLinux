@@ -106,6 +106,10 @@ log_level = 1
 # en juegos de Unreal (*-Shipping.exe) | 1 = siempre las dos cosas | 0 = nada. Ctrl+Shift+Pausa compara.
 fix_shadows = auto
 
+# depth / hybrid: HUD separation (experimental). The eyes are rebuilt from a copy of the scene taken
+# before the HUD, so the HUD stays on the screen plane. 0 = off (default), 1 = on
+hud_separation = 0
+
 # Guardar todos los shaders del juego (SPIR-V) en ~/.cache/3dvision/shaders/<juego> para
 # analizarlos (3dvision-tool shader-fix, 3dvision-shader-scan). Solo para diagnostico.
 dump_shaders = 0

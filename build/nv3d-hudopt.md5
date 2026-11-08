@@ -1,0 +1,6 @@
+3045281d2305a6d175e8f298b38a9c31  src/layer.cpp
+642a767cb8418e6443ce6e50621fdead  src/config.h
+0eea94f33737308c1d8b280ca85e9c45  src/config.cpp
+f781c7a2b44a16cd0c34609b6cb4d899  README.md
+cf931c9fa6a0e908daec93435c6cb512  default.conf.example
+3f2a5f9dbce05b32de5a86a4e7f66e78  build/lib3dvision_layer32.so

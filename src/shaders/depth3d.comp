@@ -10,18 +10,24 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32s { uint v[]; };
 layout(push_constant) uniform PC {
   U32s color;   // game image, W*H 32-bit pixels
-  U32s depth;   // raw depth copy (Dw*Dh texels)
+  U32s depth;   // raw depth copies, one per scene stage (meta[25] words apart)
   U32s keys;    // 2*W*H: winner per eye pixel ((nearness+1) << 13 | centre << 12 | source x), 0 = empty
   U32s outc;    // 2*W*H: eye images
-  U32s meta;    // [0] Dw [1] Dh [2] format 0 f32, 1 unorm24, 2 unorm16 [3] copies
+  U32s meta;    // stage s: [4s] Dw [4s+1] Dh [4s+2] format 0 f32, 1 unorm24, 2 unorm16;
+                // [16+s] A, [20+s] B of its projection (float bits); [24] stages of this frame; [25] stride;
+                // [26] 1 = the depth is upside down (Unity draws its scene upside down into textures)
   uint W, H;
-  float a, b;   // z_ndc = a + b / w (from the projection samples)
+  float a, b;   // b != 0: depth available this frame (the projections are in meta)
   float kL, kR; // per-eye shift at infinity (NDC); 0 = 2D
   float conv;   // depth (game units) on the screen plane
   float maxShift;
   U32s prev;    // hybrid: 2*W*H last real image of each eye
   uint hyb;     // hybrid: bit 0 prev of the rebuilt eye valid, bit 1 prev of the real eye valid,
                 // bit 4 = the real eye (the colour image belongs to it)
+  U32s stats;   // [0..3] orientation test: depth edges / edges also in the colour, normal and flipped;
+                // [4] [5] HUD separation: samples / samples that are HUD
+  U32s snap;    // the game's back buffer before the HUD (the scene alone)
+  uint snapFlags;  // 1 valid, 2 red / blue swapped
 } pc;
 
 // colour unchanged (per 8-bit channel) between this frame and the previous real image of the same eye
@@ -30,48 +36,110 @@ bool Same(uint a, uint b) {
   return max(max(d.x, d.y), max(d.z, d.w)) <= 6u;
 }
 
-float DepthAt(uint idx, uint fmt) {
+float DepthAt(uint stage, uint idx, uint fmt) {
+  uint base = stage * pc.meta.v[25];
   if (fmt == 2u) {
-    uint word = pc.depth.v[idx >> 1];
+    uint word = pc.depth.v[base + (idx >> 1)];
     return float((idx & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu)) / 65535.0;
   }
-  if (fmt == 1u) return float(pc.depth.v[idx] & 0xFFFFFFu) / 16777215.0;
-  return uintBitsToFloat(pc.depth.v[idx]);
+  if (fmt == 1u) return float(pc.depth.v[base + idx] & 0xFFFFFFu) / 16777215.0;
+  return uintBitsToFloat(pc.depth.v[base + idx]);
 }
 
-// 1/w of the game pixel (x, y), no dilation (0 if there is no depth)
-float InvWAt(uint x, uint y) {
-  uint Dw = pc.meta.v[0], Dh = pc.meta.v[1];
-  if (Dw == 0u || Dh == 0u || pc.b == 0.0) return 0.0;
-  uint idx = min(y * Dh / pc.H, Dh - 1u) * Dw + min(x * Dw / pc.W, Dw - 1u);
-  float iw = (DepthAt(idx, pc.meta.v[2]) - pc.a) / pc.b;
-  return iw > 0.0 ? iw : 0.0;
+// 1/w of the game pixel (x, y), no dilation (0 if there is no depth). The scene can be drawn in
+// stages that clear the depth (several cameras): the latest stage that drew something at this
+// pixel is what the pixel shows; each stage converts its depth with its own projection.
+// A depth with another shape than the game image is the scene shown centred with black bars
+// (e.g. 16:10 in 16:9); flip = the depth rows are upside down.
+float InvWFlip(uint x, uint y, uint flip) {
+  if (pc.b == 0.0) return 0.0;
+  uint mask = pc.meta.v[24];
+  for (int s = 3; s >= 0; --s) {
+    if ((mask & (1u << uint(s))) == 0u) continue;
+    uint Dw = pc.meta.v[4 * s], Dh = pc.meta.v[4 * s + 1], fmt = pc.meta.v[4 * s + 2];
+    if (Dw == 0u || Dh == 0u) continue;
+    float ad = float(Dw) / float(Dh), ai = float(pc.W) / float(pc.H);
+    float rx0 = 0.0, ry0 = 0.0, rw = float(pc.W), rh = float(pc.H);
+    if (abs(ad / ai - 1.0) > 0.01) {
+      if (ad < ai) { rw = float(pc.H) * ad; rx0 = (float(pc.W) - rw) * 0.5; }
+      else { rh = float(pc.W) / ad; ry0 = (float(pc.H) - rh) * 0.5; }
+    }
+    float u = (float(x) + 0.5 - rx0) / rw, v = (float(y) + 0.5 - ry0) / rh;
+    if (u < 0.0 || u >= 1.0 || v < 0.0 || v >= 1.0) return 1.0 / max(pc.conv, 1.0e-6);  // black bars: screen plane
+    if (flip != 0u) v = 1.0 - v;
+    uint idx = min(uint(v * float(Dh)), Dh - 1u) * Dw + min(uint(u * float(Dw)), Dw - 1u);
+    float z = DepthAt(uint(s), idx, fmt);
+    if (z <= 0.0 || z >= 1.0) continue;  // cleared here (normal or reversed depth): an earlier stage
+    float iw = (z - uintBitsToFloat(pc.meta.v[16 + s])) / uintBitsToFloat(pc.meta.v[20 + s]);
+    if (iw > 0.0) return min(iw, 1.0e30);
+  }
+  return 0.0;
 }
+float InvWAt(uint x, uint y) { return InvWFlip(x, y, pc.meta.v[26]); }
+
+// width of the scene on screen (between black bars): the game's NDC spans it, so shifts scale with it
+float SceneWidth() {
+  uint mask = pc.meta.v[24];
+  for (int s = 3; s >= 0; --s) {
+    if ((mask & (1u << uint(s))) == 0u || pc.meta.v[4 * s + 1] == 0u) continue;
+    float ad = float(pc.meta.v[4 * s]) / float(pc.meta.v[4 * s + 1]), ai = float(pc.W) / float(pc.H);
+    return (abs(ad / ai - 1.0) > 0.01 && ad < ai) ? float(pc.H) * ad : float(pc.W);
+  }
+  return float(pc.W);
+}
+
+uint Diff(uint a, uint b) {
+  uvec4 d = uvec4(abs(ivec4(unpackUnorm4x8(a) * 255.0) - ivec4(unpackUnorm4x8(b) * 255.0)));
+  return max(max(d.x, d.y), max(d.z, d.w));
+}
+
+uint SnapAt(uint i) {
+  uint c = pc.snap.v[i];
+  if ((pc.snapFlags & 2u) != 0u) c = (c & 0xFF00FF00u) | ((c & 0xFFu) << 16) | ((c >> 16) & 0xFFu);
+  return c;
+}
+// drawn after the scene was copied: HUD, crosshair, markers, menus
+// (the copy and the presented image are the same bytes except where something was drawn after the copy)
+bool HudAt(uint i) { return (pc.snapFlags & 1u) != 0u && Diff(SnapAt(i), pc.color.v[i]) > 2u; }
+// the colour the eyes are rebuilt from: the scene without HUD when available
+uint SrcAt(uint i) { return (pc.snapFlags & 1u) != 0u ? SnapAt(i) : pc.color.v[i]; }
+
+float Luma(uint c) { vec4 v = unpackUnorm4x8(c); return dot(v.rgb, vec3(0.3, 0.59, 0.11)); }
 
 void main() {
   uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
   if (x >= pc.W || y >= pc.H) return;
   uint WH = pc.W * pc.H;
 #if PASS == 0
-  uint Dw = pc.meta.v[0], Dh = pc.meta.v[1], fmt = pc.meta.v[2];
-  bool have = Dw > 0u && Dh > 0u && pc.b != 0.0;
+  bool have = pc.b != 0.0;
+  if (have && (pc.snapFlags & 1u) != 0u && (x & 7u) == 0u && (y & 7u) == 0u) {
+    atomicAdd(pc.stats.v[4], 1u);
+    if (HudAt(y * pc.W + x)) atomicAdd(pc.stats.v[5], 1u);
+  }
+  // orientation test on a sparse grid: do the depth edges match the colour edges as is, or upside down?
+  if (have && (x & 7u) == 0u && (y & 7u) == 0u && x + 3u < pc.W) {
+    bool colEdge = abs(Luma(pc.color.v[y * pc.W + x]) - Luma(pc.color.v[y * pc.W + x + 3u])) > 0.09;
+    for (uint h = 0u; h < 2u; ++h) {
+      float a = InvWFlip(x, y, h), b = InvWFlip(x + 3u, y, h);
+      bool dEdge = (a > 0.0 || b > 0.0) && max(a, b) > 1.25 * min(a, b);
+      if (dEdge) {
+        atomicAdd(pc.stats.v[2u * h], 1u);
+        if (colEdge) atomicAdd(pc.stats.v[2u * h + 1u], 1u);
+      }
+    }
+  }
   float invW = 0.0;
   if (have) {
     // nearest of five neighbours: edge pixels (blends of object and background from antialiasing,
     // TAA or scaling) move with the object instead of being left behind as a halo
-    uint dy = min(y * Dh / pc.H, Dh - 1u);
-    for (int o = -2; o <= 2; ++o) {
-      uint dx = uint(clamp(int(x * Dw / pc.W) + o, 0, int(Dw) - 1));
-      float iw = (DepthAt(dy * Dw + dx, fmt) - pc.a) / pc.b;
-      if (iw > invW) invW = iw;  // (NaN never wins)
-    }
-    invW = min(invW, 1.0e30);
+    for (int o = -2; o <= 2; ++o) invW = max(invW, InvWAt(uint(clamp(int(x) + o, 0, int(pc.W) - 1)), y));
   }
   float base = 1.0 - pc.conv * invW;
+  float sceneW = have ? SceneWidth() : float(pc.W);
   uint key = (((floatBitsToUint(invW) >> 12) + 1u) << 13) | x;
   for (uint e = 0u; e < 2u; ++e) {
     float k = e == 0u ? pc.kL : pc.kR;
-    float shift = have ? clamp(k * base * float(pc.W) * 0.5, -pc.maxShift, pc.maxShift) : 0.0;
+    float shift = have ? clamp(k * base * sceneW * 0.5, -pc.maxShift, pc.maxShift) : 0.0;
     // the pixel goes to the two eye pixels around its shifted position (no cracks where the image
     // stretches); the one that holds its centre has priority, so there is no half-pixel bias
     // (hybrid mode alternates real and rebuilt images in each eye: a bias would shimmer)
@@ -84,12 +152,9 @@ void main() {
     }
   }
 #else
-  if (pc.maxShift < 0.0) {  // debug (NV3D_DEPTH_SHOW=1): both eyes show the raw depth as grey
-    uint Dw = pc.meta.v[0], Dh = pc.meta.v[1], fmt = pc.meta.v[2];
-    float d = 0.0;
-    if (Dw > 0u) {
-      d = DepthAt(min(y * Dh / pc.H, Dh - 1u) * Dw + min(x * Dw / pc.W, Dw - 1u), fmt);
-    }
+  if (pc.maxShift < 0.0) {  // debug (NV3D_DEPTH_SHOW=1): both eyes show the rebuilt distance as grey
+    float iw = InvWAt(x, y);
+    float d = iw > 0.0 ? 1.0 / (1.0 + pc.conv * iw) : 1.0;  // near dark, far light, convergence = mid grey
     uint g = uint(clamp(d, 0.0, 1.0) * 255.0);
     pc.outc.v[y * pc.W + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
     pc.outc.v[WH + y * pc.W + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
@@ -112,6 +177,10 @@ void main() {
     uint row = e * WH + y * pc.W;
     if (still && e != realE) {
       pc.outc.v[row + x] = pc.prev.v[row + x];
+      continue;
+    }
+    if (HudAt(y * pc.W + x) && (pc.hyb == 0u || e != realE)) {
+      pc.outc.v[row + x] = pc.color.v[y * pc.W + x];  // HUD: on the screen plane, in both eyes
       continue;
     }
     uint key = pc.keys.v[row + x];
@@ -144,7 +213,22 @@ void main() {
     } else {
       sx = key & 0xFFFu;
     }
-    pc.outc.v[row + x] = pc.color.v[y * pc.W + sx];
+    uint c = SrcAt(y * pc.W + sx);
+    if ((pc.snapFlags & 1u) == 0u && (pc.hyb & 1u) != 0u && e != realE && sx != x) {
+      // HUD, crosshair, markers, menus are drawn after the scene and are not in the depth: they
+      // belong on the screen plane. Evidence: the last real image of this eye. If the pixel left
+      // where it is matches it much better than the rebuilt one, it is screen-plane content.
+      // (strict, and the neighbours must agree: a pixel-by-pixel choice in textured areas mixes two
+      // positions: dotted text, objects that look translucent)
+      uint ref = pc.prev.v[row + x], z = pc.color.v[y * pc.W + x];
+      uint dZ = Diff(z, ref);
+      uint xl = x > 0u ? x - 1u : x, xr = min(x + 1u, pc.W - 1u);
+      uint agree = (dZ <= 6u ? 1u : 0u) +
+                   (Diff(pc.color.v[y * pc.W + xl], pc.prev.v[e * WH + y * pc.W + xl]) <= 6u ? 1u : 0u) +
+                   (Diff(pc.color.v[y * pc.W + xr], pc.prev.v[e * WH + y * pc.W + xr]) <= 6u ? 1u : 0u);
+      if (agree == 3u && Diff(c, ref) > dZ + 40u) c = z;
+    }
+    pc.outc.v[row + x] = c;
   }
 #endif
 }

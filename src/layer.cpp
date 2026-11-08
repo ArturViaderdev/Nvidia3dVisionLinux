@@ -81,7 +81,9 @@ namespace {
   X(BindBufferMemory) X(MapMemory) X(UnmapMemory) X(GetBufferDeviceAddress)                 \
   X(GetBufferDeviceAddressKHR) X(CreateCommandPool) X(DestroyCommandPool)                   \
   X(AllocateCommandBuffers) X(FreeCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) \
-  X(ResetCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdBlitImage)               \
+  X(ResetCommandBuffer) X(CmdPipelineBarrier) X(CmdPipelineBarrier2) X(CmdPipelineBarrier2KHR)       \
+  X(CmdCopyImage) X(CmdBlitImage) X(CmdCopyImage2) X(CmdCopyImage2KHR) X(CmdBlitImage2)      \
+  X(CmdBlitImage2KHR) X(CmdResolveImage) X(CmdResolveImage2) X(CmdResolveImage2KHR) X(CmdExecuteCommands) \
   X(CmdUpdateBuffer) X(CmdCopyBuffer) X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CreateFence) X(DestroyFence) X(WaitForFences)  \
   X(ResetFences) X(CreateSemaphore) X(DestroySemaphore) X(WaitSemaphores) X(WaitSemaphoresKHR)  \
   X(GetFenceStatus) X(WaitForPresentKHR) X(InvalidateMappedMemoryRanges)                  \
@@ -294,6 +296,11 @@ struct DeviceData {
   // scene with another (EDF 6): only the last stage is in the depth copy, so only its camera counts.
   std::atomic<uint32_t> calibGroup{0};     // stage of the pass being recorded (reset every frame)
   std::atomic<uint32_t> lastCopyGroup{0};  // stage of the last depth copy
+  std::atomic<uint32_t> copiedStages{0};   // stages whose depth was copied in the frame being recorded
+  uint64_t lastClassFrame = 0;
+  uint32_t depthFlip = 0;                  // the depth is upside down compared with the image (Unity)
+  int flipVotes = 0;
+  uint64_t lastFlipCheck = 0;
   bool hintedDepth = false;
   bool canCalib = false;     // vertexPipelineStoresAndAtomics enabled
   std::mutex depthLock;
@@ -301,6 +308,33 @@ struct DeviceData {
   std::unordered_map<VkImage, DepthImg> depthImgs;
   struct ViewInfo { VkImage img; uint32_t mip, layer; };
   std::unordered_map<VkImageView, ViewInfo> depthViews;
+  // HUD separation (depth / hybrid): the game's own back buffer gets the finished scene first and
+  // the HUD on top; a copy taken in between is the scene without HUD (under depthLock)
+  struct ColorImg { VkFormat fmt; VkExtent2D ext; uint32_t samples; };
+  std::unordered_map<VkImage, ColorImg> colorImgs;
+  std::unordered_map<VkImageView, VkImage> colorViews;
+  std::unordered_set<VkImage> presentedImgs;   // the layer's virtual swapchain images
+  VkExtent2D gameExt{};
+  VkFormat scFormat = VK_FORMAT_UNDEFINED;
+  VkImage lastColorImg = VK_NULL_HANDLE;       // colour target of the last game-sized pass
+  VkImage bbCand = VK_NULL_HANDLE, bbImg = VK_NULL_HANDLE;
+  int bbVotes = 0;
+  bool bbUsable = false, bbSwapRB = false;
+  // a multisampled back buffer is resolved into this image before the snapshot copy
+  VkImage bbResolve = VK_NULL_HANDLE;
+  VkDeviceMemory bbResolveMem = VK_NULL_HANDLE;
+  VkFormat bbResolveFmt = VK_FORMAT_UNDEFINED;
+  VkExtent2D bbResolveExt{};
+  uint32_t bbSamples = 1;
+  std::vector<std::pair<VkImage, VkDeviceMemory>> retiredImgs;
+  VkBuffer snapBuf = VK_NULL_HANDLE;
+  VkDeviceMemory snapMem = VK_NULL_HANDLE;
+  VkDeviceAddress snapAddr = 0;
+  VkDeviceSize snapSize = 0;
+  std::atomic<bool> snapDone{false}, snapFrameOk{false}, bbFilled{false};
+  bool snapBad = false, loggedSnap = false;
+  std::atomic<int> traceFrames{0};  // Ctrl+Shift+F11 in depth / hybrid: log the passes of the next frame
+  uint64_t snapBadUntil = 0;
   VkBuffer depthBuf = VK_NULL_HANDLE;       // raw depth copy, written inside the game's command buffers
   VkDeviceMemory depthMem = VK_NULL_HANDLE;
   VkDeviceAddress depthAddr = 0;
@@ -688,7 +722,11 @@ struct SynthPC {
   float a, b, kL, kR, conv, maxShift;
   uint64_t prev;   // hybrid: last real image of each eye (2*W*H), holes are filled from it
   uint32_t hyb;    // 1 = fill holes from prev
+  uint64_t stats;  // orientation test counters (host-visible, in the parameter buffer)
+  uint64_t snap;   // HUD separation: the game's back buffer before the HUD (W*H)
+  uint32_t snapFlags;  // 1 = valid this frame, 2 = red / blue swapped compared with the game image
 };
+constexpr uint32_t kStatsOffset = 3072;  // in the parameter buffer, after the projection samples
 
 bool InitDepthMode(DeviceData* dd) {
   if (!CreateDevBuf(dd, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dd->metaBuf,
@@ -730,14 +768,24 @@ void DestroyDepthMode(DeviceData* dd) {
     if (m) dd->d.FreeMemory(dev, m, nullptr);
   };
   freeBuf(dd->depthBuf, dd->depthMem);
+  freeBuf(dd->snapBuf, dd->snapMem);
   freeBuf(dd->metaBuf, dd->metaMem);
   for (auto& r : dd->retiredBufs) freeBuf(r.first, r.second);
   dd->retiredBufs.clear();
+  if (dd->bbResolve) dd->retiredImgs.push_back({dd->bbResolve, dd->bbResolveMem});
+  dd->bbResolve = VK_NULL_HANDLE;
+  dd->bbResolveMem = VK_NULL_HANDLE;
+  for (auto& r : dd->retiredImgs) {
+    dd->d.DestroyImage(dev, r.first, nullptr);
+    if (r.second) dd->d.FreeMemory(dev, r.second, nullptr);
+  }
+  dd->retiredImgs.clear();
 }
 
 // the depth copy target, big enough for the game image at up to 1.5x its size in each direction
 void EnsureDepthBuffer(DeviceData* dd, VkExtent2D game) {
-  VkDeviceSize need = VkDeviceSize(game.width) * game.height * 4 * 9 / 4;
+  // one copy per scene stage (4); each big enough for up to 1.5x the game image in each direction
+  VkDeviceSize need = (VkDeviceSize(game.width) * game.height * 4 * 9 / 4 + 255) & ~VkDeviceSize(255);
   std::lock_guard<std::mutex> l(dd->depthLock);
   dd->depthAspect = float(game.width) / float(std::max(1u, game.height));
   dd->depthArea = float(game.width) * float(game.height);
@@ -745,8 +793,8 @@ void EnsureDepthBuffer(DeviceData* dd, VkExtent2D game) {
   VkBuffer b;
   VkDeviceMemory m;
   VkDeviceAddress a;
-  if (!CreateDevBuf(dd, need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &b, &m, &a)) {
-    Log(0, "depth mode: cannot allocate %llu bytes for the depth copy", (unsigned long long)need);
+  if (!CreateDevBuf(dd, need * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &b, &m, &a)) {
+    Log(0, "depth mode: cannot allocate %llu bytes for the depth copies", (unsigned long long)need * 4);
     return;
   }
   // the old one may be referenced by command buffers the game already recorded
@@ -767,6 +815,21 @@ struct CbDepth {
   bool active = false, suspending = false, secondary = false;
   bool clears = false;  // the pass clears the depth (loadOp CLEAR)
   int flag = -1;        // params.flags last set in this command buffer (-1: not yet)
+  // the scene depth to copy: copied once per stage, just before the game clears it for the next stage
+  // or when the command buffer ends (not after every pass: EDF 6 has ~30 scene passes per frame)
+  bool pending = false;
+  VkImage pImg = VK_NULL_HANDLE;
+  VkFormat pFmt = VK_FORMAT_UNDEFINED;
+  VkExtent2D pExt{};
+  VkImageLayout pLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  uint32_t pMip = 0, pLayer = 0, pStage = 0;
+  // the current pass draws into the game's back buffer (HUD separation)
+  bool bbPass = false, bbKhr = false, bbCanSplit = false, bbSecondary = false;
+  VkImage bbImg = VK_NULL_HANDLE;
+  VkImageLayout bbLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkRenderingInfo bbInfo{};
+  std::vector<VkRenderingAttachmentInfo> bbColors;
+  VkRenderingAttachmentInfo bbDepth{}, bbStencil{};
 };
 std::mutex g_cbLock;
 std::unordered_map<VkCommandBuffer, CbDepth> g_cbDepth;
@@ -791,6 +854,18 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateImage(VkDevice device, const VkImageCr
   DeviceData* dd = Dev(device);
   bool depth = dd->depthMode && IsDepthFormat(ci->format) && ci->imageType == VK_IMAGE_TYPE_2D &&
                (ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+  bool color = dd->depthMode && !depth && ci->imageType == VK_IMAGE_TYPE_2D &&
+               (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && ci->mipLevels >= 1;
+  if (color) {  // possibly the game's back buffer: the layer may copy it (scene before the HUD)
+    VkImageCreateInfo c = *ci;
+    c.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // (multisampled: the source of a resolve)
+    VkResult r = dd->d.CreateImage(device, &c, a, img);
+    if (r != VK_SUCCESS) r = dd->d.CreateImage(device, ci, a, img);
+    if (r != VK_SUCCESS) return r;
+    std::lock_guard<std::mutex> l(dd->depthLock);
+    dd->colorImgs[*img] = {ci->format, {ci->extent.width, ci->extent.height}, uint32_t(ci->samples)};
+    return r;
+  }
   if (!depth) return dd->d.CreateImage(device, ci, a, img);
   VkImageCreateInfo c = *ci;
   c.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // so the layer can copy it
@@ -805,6 +880,10 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyImage(VkDevice device, VkImage img, const
   if (dd->depthMode && img) {
     std::lock_guard<std::mutex> l(dd->depthLock);
     dd->depthImgs.erase(img);
+    dd->colorImgs.erase(img);
+    if (img == dd->bbImg) dd->bbImg = VK_NULL_HANDLE, dd->bbUsable = false;
+    if (img == dd->bbCand) dd->bbCand = VK_NULL_HANDLE;
+    if (img == dd->lastColorImg) dd->lastColorImg = VK_NULL_HANDLE;
   }
   dd->d.DestroyImage(device, img, a);
 }
@@ -816,6 +895,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateImageView(VkDevice device, const VkIma
     std::lock_guard<std::mutex> l(dd->depthLock);
     if (dd->depthImgs.count(ci->image))
       dd->depthViews[*view] = {ci->image, ci->subresourceRange.baseMipLevel, ci->subresourceRange.baseArrayLayer};
+    else if (dd->colorImgs.count(ci->image) || dd->presentedImgs.count(ci->image))
+      dd->colorViews[*view] = ci->image;
   }
   return r;
 }
@@ -824,6 +905,7 @@ VKAPI_ATTR void VKAPI_CALL hook_DestroyImageView(VkDevice device, VkImageView vi
   if (dd->depthMode && view) {
     std::lock_guard<std::mutex> l(dd->depthLock);
     dd->depthViews.erase(view);
+    dd->colorViews.erase(view);
   }
   dd->d.DestroyImageView(device, view, a);
 }
@@ -848,7 +930,8 @@ void BeginRenderingCommon(TlsCb& t, const VkRenderingInfo* ri) {
   float asp = float(e.width) / float(e.height), want = dd->depthAspect.load();
   // the scene's depth has (about) the shape and size of the game image; shadow maps, reflections
   // and other small passes do not
-  if (want <= 0 || std::fabs(asp / want - 1.0f) > 0.10f) return;
+  // (up to 30% off: a 16:10 or 4:3 scene shown with black bars in a 16:9 window; square shadow maps are 44% off)
+  if (want <= 0 || std::fabs(asp / want - 1.0f) > 0.30f) return;
   if (float(e.width) * float(e.height) < 0.4f * dd->depthArea.load()) return;
   VkDeviceSize bytes = VkDeviceSize(e.width) * e.height * (DepthCode(im->second.fmt) == 2 ? 2 : 4);
   if (bytes > dd->depthCap || e.width < 320) return;
@@ -863,11 +946,13 @@ void BeginRenderingCommon(TlsCb& t, const VkRenderingInfo* ri) {
 }
 
 // right after a scene pass: copy its depth into the layer's buffer, inside the game's command buffer
-void RecordDepthCopy(DeviceData* dd, VkCommandBuffer cb, const CbDepth& st) {
+void RecordDepthCopy(DeviceData* dd, VkCommandBuffer cb, const CbDepth& st, uint32_t stage) {
   VkBuffer dst;
+  VkDeviceSize stride;
   {
     std::lock_guard<std::mutex> l(dd->depthLock);
     dst = dd->depthBuf;
+    stride = dd->depthCap;
   }
   if (!dst) return;
   const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(st.fmt) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
@@ -888,12 +973,16 @@ void RecordDepthCopy(DeviceData* dd, VkCommandBuffer cb, const CbDepth& st) {
   mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   dd->d.CmdPipelineBarrier(cb, DEPTH_STAGES | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 1, &ib);
+  // each scene stage (calibGroup) has its own copy: the eyes combine them pixel by pixel
+  stage &= 3;
   VkBufferImageCopy r{};
+  r.bufferOffset = stride * stage;
   r.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, st.mip, st.layer, 1};
   r.imageExtent = {st.ext.width, st.ext.height, 1};
   dd->d.CmdCopyImageToBuffer(cb, st.img, copyLayout, dst, 1, &r);
   uint32_t meta[3] = {st.ext.width, st.ext.height, DepthCode(st.fmt)};
-  dd->d.CmdUpdateBuffer(cb, dd->metaBuf, 0, sizeof(meta), meta);
+  dd->d.CmdUpdateBuffer(cb, dd->metaBuf, 16 * stage, sizeof(meta), meta);
+  dd->copiedStages |= 1u << stage;
   ib.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   ib.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
@@ -905,7 +994,28 @@ void RecordDepthCopy(DeviceData* dd, VkCommandBuffer cb, const CbDepth& st) {
                            nullptr, 1, &ib);
   ++dd->depthCopies;
   dd->lastDepthFrame = dd->frame;
-  dd->lastCopyGroup = dd->calibGroup.load();
+  dd->lastCopyGroup = stage;
+}
+
+// copies the pending scene depth of this command buffer (in its current layout)
+void FlushDepthCopy(DeviceData* dd, VkCommandBuffer cb, CbDepth& st) {
+  if (!st.pending) return;
+  st.pending = false;
+  if (dd->traceFrames.load() > 0) Log(1, "  depth copy (stage %u, cb %p)", st.pStage, (void*)cb);
+  CbDepth c;
+  c.img = st.pImg;
+  c.fmt = st.pFmt;
+  c.ext = st.pExt;
+  c.layout = st.pLayout;
+  c.mip = st.pMip;
+  c.layer = st.pLayer;
+  RecordDepthCopy(dd, cb, c, st.pStage);
+}
+// the game changes the layout of the pending depth image: follow it (or drop it if discarded)
+void NoteDepthBarrier(CbDepth& st, VkImage img, VkImageLayout oldL, VkImageLayout newL) {
+  if (!st.pending || img != st.pImg) return;
+  if (oldL == VK_IMAGE_LAYOUT_UNDEFINED) st.pending = false;  // contents discarded
+  else st.pLayout = newL;
 }
 
 // params.flags (projection samples): 1 + stage inside the scene's passes, 0 elsewhere (shadow maps,
@@ -943,7 +1053,17 @@ void EndRenderingCommon(TlsCb& t, VkCommandBuffer cb) {
                         st.layout == VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL ||
                         st.layout == VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL ||
                         st.layout == VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
-  if ((main == 0 || main == cls) && (st.draws >= 8 || st.secondary) && !readOnly) RecordDepthCopy(dd, cb, st);
+  if ((main == 0 || main == cls) && (st.draws >= 8 || st.secondary) && !readOnly) {
+    if (st.pending && st.pImg != st.img) FlushDepthCopy(dd, cb, st);  // another image: keep that one too
+    st.pending = true;
+    st.pImg = st.img;
+    st.pFmt = st.fmt;
+    st.pExt = st.ext;
+    st.pLayout = st.layout;
+    st.pMip = st.mip;
+    st.pLayer = st.layer;
+    st.pStage = dd->calibGroup.load();
+  }
 }
 // called by the presenter side every few frames: the class with the most draws is the scene
 void UpdateMainDepthClass(DeviceData* dd) {
@@ -960,12 +1080,416 @@ void UpdateMainDepthClass(DeviceData* dd) {
   dd->classDraws.clear();
 }
 
+
+// ------------------------------------------------------------------------------------
+// HUD separation (depth / hybrid). DXVK / VKD3D games draw into their own back buffer: first the
+// finished scene (one full-screen draw or a copy), then the HUD on top; at present that back buffer
+// is copied into the image the layer presents. The layer learns which image that is, copies it
+// right after the scene arrived (splitting the game's pass after its first draw if needed), and
+// the eyes are rebuilt from that copy, with what was drawn after it (HUD, crosshair, markers,
+// menus) put back on the screen plane.
+// ------------------------------------------------------------------------------------
+inline bool IsRGBA8(VkFormat f) {
+  return f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_A8B8G8R8_UNORM_PACK32 ||
+         f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+}
+inline bool IsBGRA8(VkFormat f) { return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB; }
+// a format a back buffer can have (what is shown); HDR scene targets (16-bit float, B10G11R11) are not
+inline bool IsDisplayFormat(VkFormat f) {
+  return IsRGBA8(f) || IsBGRA8(f) || f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
+bool CreateImageMem(DeviceData* dd, VkImageCreateInfo ici, VkImage* img, VkDeviceMemory* mem);
+// an image whose content went into the presented image (caller holds depthLock)
+void VoteBackbufferLocked(DeviceData* dd, VkImage cand) {
+  if (!cand || dd->presentedImgs.count(cand)) return;
+  auto cf = dd->colorImgs.find(cand);
+  if (cf == dd->colorImgs.end() || !IsDisplayFormat(cf->second.fmt)) return;
+  if (cand == dd->bbCand) ++dd->bbVotes;
+  else dd->bbCand = cand, dd->bbVotes = 1;
+  if (dd->bbVotes < 3 || cand == dd->bbImg) return;
+  dd->bbImg = cand;
+  auto it = dd->colorImgs.find(cand);
+  if (it == dd->colorImgs.end()) { dd->bbUsable = false; return; }
+  const DeviceData::ColorImg& ci = it->second;
+  bool fmtOk = ((IsRGBA8(ci.fmt) || IsBGRA8(ci.fmt)) && (IsRGBA8(dd->scFormat) || IsBGRA8(dd->scFormat))) ||
+               (ci.fmt == dd->scFormat && IsDisplayFormat(ci.fmt));
+  bool extOk = ci.ext.width == dd->gameExt.width && ci.ext.height == dd->gameExt.height;
+  dd->bbSamples = ci.samples;
+  if (fmtOk && extOk && ci.samples > 1 &&
+      (!dd->bbResolve || dd->bbResolveFmt != ci.fmt || dd->bbResolveExt.width != ci.ext.width ||
+       dd->bbResolveExt.height != ci.ext.height)) {
+    if (dd->bbResolve) dd->retiredImgs.push_back({dd->bbResolve, dd->bbResolveMem});
+    dd->bbResolve = VK_NULL_HANDLE;
+    dd->bbResolveMem = VK_NULL_HANDLE;
+    VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ic.imageType = VK_IMAGE_TYPE_2D;
+    ic.format = ci.fmt;
+    ic.extent = {ci.ext.width, ci.ext.height, 1};
+    ic.mipLevels = 1;
+    ic.arrayLayers = 1;
+    ic.samples = VK_SAMPLE_COUNT_1_BIT;
+    ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ic.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImage im = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (CreateImageMem(dd, ic, &im, &mem)) {
+      dd->bbResolve = im, dd->bbResolveMem = mem, dd->bbResolveFmt = ci.fmt, dd->bbResolveExt = ci.ext;
+    } else {
+      if (im) dd->retiredImgs.push_back({im, mem});
+    }
+  }
+  bool resolveOk = ci.samples == 1 || dd->bbResolve;
+  dd->bbUsable = Cfg().hudSeparation && fmtOk && extOk && resolveOk && dd->snapBuf;
+  dd->bbSwapRB = fmtOk && IsRGBA8(ci.fmt) != IsRGBA8(dd->scFormat);
+  Log(1, "HUD separation: the game's back buffer is a %ux%u image (format %d, %u samples)%s", ci.ext.width,
+      ci.ext.height, int(ci.fmt), ci.samples,
+      dd->bbUsable ? "" : !Cfg().hudSeparation ? " (hud_separation = 0: not used)" : !fmtOk ? ": format not supported" : !extOk ? ": another size than the game image, not used"
+                                                             : ": could not make its resolve image, not used");
+}
+
+// copies the back buffer (= the scene without HUD) into snapBuf, outside any render pass
+void RecordSnapshot(DeviceData* dd, VkCommandBuffer cb, VkImage img, VkImageLayout layout) {
+  VkBuffer dst;
+  VkExtent2D ext;
+  VkImage rimg;
+  uint32_t samples;
+  {
+    std::lock_guard<std::mutex> l(dd->depthLock);
+    dst = dd->snapBuf;
+    ext = dd->gameExt;
+    rimg = dd->bbResolve;
+    samples = dd->bbSamples;
+  }
+  if (!dst || layout == VK_IMAGE_LAYOUT_UNDEFINED || (samples > 1 && !rimg) || dd->snapDone.exchange(true)) return;
+  if (dd->traceFrames.load() > 0) Log(1, "  -> scene snapshot (HUD separation)%s", samples > 1 ? ", resolved" : "");
+  if (samples > 1) {  // multisampled: resolve into the layer's image, then copy that one
+    VkImageMemoryBarrier bs[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+    const VkImageLayout sl = layout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    for (auto& b : bs) {
+      b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    bs[0].image = img;
+    bs[0].oldLayout = layout;
+    bs[0].newLayout = sl;
+    bs[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    bs[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bs[1].image = rimg;
+    bs[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bs[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bs[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bs[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dd->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, bs);
+    VkImageResolve rr{};
+    rr.srcSubresource = rr.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    rr.extent = {ext.width, ext.height, 1};
+    dd->d.CmdResolveImage(cb, img, sl, rimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rr);
+    bs[0].oldLayout = sl;
+    bs[0].newLayout = layout;
+    bs[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bs[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    bs[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bs[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bs[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bs[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};  // earlier readers of snapBuf (the eyes' compute)
+    mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dd->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                             nullptr, 2, bs);
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {ext.width, ext.height, 1};
+    dd->d.CmdCopyImageToBuffer(cb, rimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1, &r);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dd->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+    dd->snapFrameOk = true;
+    return;
+  }
+  const VkImageLayout cl = layout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  ib.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  ib.oldLayout = layout;
+  ib.newLayout = cl;
+  ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  ib.image = img;
+  ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};  // earlier readers of snapBuf (the eyes' compute)
+  mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  dd->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 1, &ib);
+  VkBufferImageCopy r{};
+  r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.imageExtent = {ext.width, ext.height, 1};
+  dd->d.CmdCopyImageToBuffer(cb, img, cl, dst, 1, &r);
+  ib.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  ib.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  ib.oldLayout = cl;
+  ib.newLayout = layout;
+  mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  dd->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                           nullptr, 1, &ib);
+  dd->snapFrameOk = true;
+}
+
+// before the game's pass begins: does it draw into the presented image (then the last game-sized
+// target is the back buffer candidate) or into the back buffer?
+void NoteColorPass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri, bool khr) {
+  CbDepth& st = *t.st;
+  DeviceData* dd = t.dd;
+  if (ri->flags & VK_RENDERING_RESUMING_BIT) return;  // a resumed pass keeps its state
+  st.bbPass = false;
+  if (!dd->depthMode || !ri->colorAttachmentCount || !ri->pColorAttachments || !ri->pColorAttachments[0].imageView)
+    return;
+  const VkRenderingAttachmentInfo& ca = ri->pColorAttachments[0];
+  VkImage img;
+  bool isBB;
+  {
+    std::lock_guard<std::mutex> l(dd->depthLock);
+    // a multisampled target is resolved into a normal image at the end of the pass: that one is the output
+    VkImageView outView = (ca.resolveMode != VK_RESOLVE_MODE_NONE && ca.resolveImageView) ? ca.resolveImageView
+                                                                                       : ca.imageView;
+    auto v = dd->colorViews.find(outView);
+    if (v == dd->colorViews.end()) return;
+    img = v->second;
+    if (dd->presentedImgs.count(img)) {
+      VoteBackbufferLocked(dd, dd->lastColorImg);
+      // the game's frame is finished (recording order: games that record on several threads present late)
+      dd->snapDone = false;
+      dd->bbFilled = false;
+      return;
+    }
+    // (only targets in a display format: the game may already be drawing the next frame's HDR scene
+    // when the present copy is recorded on another thread)
+    auto c = dd->colorImgs.find(img);
+    if (c != dd->colorImgs.end() && c->second.ext.width == dd->gameExt.width &&
+        c->second.ext.height == dd->gameExt.height && IsDisplayFormat(c->second.fmt))
+      dd->lastColorImg = img;
+    isBB = img == dd->bbImg && dd->bbUsable && !dd->snapBad;
+  }
+  if (!isBB) return;
+  st.bbPass = true;
+  st.bbKhr = khr;
+  st.bbImg = img;
+  st.bbLayout = ca.imageLayout;
+  st.bbCanSplit = !(ri->flags & VK_RENDERING_SUSPENDING_BIT);
+  st.bbSecondary = (ri->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) != 0;
+  // the same pass, continued (for the split after the scene's draw)
+  st.bbInfo = *ri;
+  st.bbInfo.pNext = nullptr;
+  st.bbColors.assign(ri->pColorAttachments, ri->pColorAttachments + ri->colorAttachmentCount);
+  for (auto& a : st.bbColors) a.pNext = nullptr, a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  st.bbInfo.pColorAttachments = st.bbColors.data();
+  if (ri->pDepthAttachment) {
+    st.bbDepth = *ri->pDepthAttachment;
+    st.bbDepth.pNext = nullptr;
+    st.bbDepth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    st.bbInfo.pDepthAttachment = &st.bbDepth;
+  }
+  if (ri->pStencilAttachment) {
+    st.bbStencil = *ri->pStencilAttachment;
+    st.bbStencil.pNext = nullptr;
+    st.bbStencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    st.bbInfo.pStencilAttachment = &st.bbStencil;
+  }
+  // the scene came in by a copy (CopyResource, a blit) and this pass only adds the HUD: copy now
+  if (!dd->snapDone.load() && dd->bbFilled.load() && ca.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
+    RecordSnapshot(dd, cb, img, ca.imageLayout);
+}
+
+// before a draw: the back buffer pass already has its first draw (the finished scene): copy it now,
+// before the HUD, by ending the pass and continuing it
+void BeforeDraw(TlsCb& t, VkCommandBuffer cb) {
+  CbDepth& st = *t.st;
+  if (!st.bbPass || !st.bbCanSplit || st.bbSecondary || st.draws < 1 || t.dd->snapDone.load()) return;
+  DeviceData* dd = t.dd;
+  (st.bbKhr && dd->d.CmdEndRenderingKHR ? dd->d.CmdEndRenderingKHR : dd->d.CmdEndRendering)(cb);
+  RecordSnapshot(dd, cb, st.bbImg, st.bbLayout);
+  (st.bbKhr && dd->d.CmdBeginRenderingKHR ? dd->d.CmdBeginRenderingKHR : dd->d.CmdBeginRendering)(cb, &st.bbInfo);
+}
+void AfterColorPass(TlsCb& t, VkCommandBuffer cb) {
+  CbDepth& st = *t.st;
+  if (!st.bbPass) return;
+  st.bbPass = false;
+  if (st.bbCanSplit && st.draws >= 1 && !t.dd->snapDone.load()) RecordSnapshot(t.dd, cb, st.bbImg, st.bbLayout);
+}
+// the pass's draws are in secondary command buffers (D3D11 games on DXVK may record them on worker
+// threads): the first one with draws is the scene; the pass is split after it, as after a first draw
+VKAPI_ATTR void VKAPI_CALL hook_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* cbs) {
+  TlsCb& t = CbState(cb);
+  DeviceData* dd = t.dd;
+  CbDepth* st = t.st;
+  std::vector<uint32_t> draws(n, 0);
+  {
+    std::lock_guard<std::mutex> l(g_cbLock);
+    for (uint32_t i = 0; i < n; ++i) {
+      auto it = g_cbDepth.find(cbs[i]);
+      if (it != g_cbDepth.end()) draws[i] = it->second.draws;
+    }
+  }
+  if (dd->traceFrames.load() > 0) {
+    std::string line = "    execute " + std::to_string(n) + " secondary command buffer(s), draws:";
+    for (uint32_t i = 0; i < n; ++i) line += " " + std::to_string(draws[i]);
+    Log(1, "%s", line.c_str());
+  }
+  uint32_t done = 0;
+  if (st->bbPass && st->bbSecondary && st->bbCanSplit && !dd->snapDone.load()) {
+    for (uint32_t i = 0; i < n; ++i) {
+      if (!draws[i]) continue;
+      dd->d.CmdExecuteCommands(cb, i + 1, cbs);
+      for (uint32_t k = 0; k <= i; ++k) st->draws += draws[k];
+      done = i + 1;
+      (st->bbKhr && dd->d.CmdEndRenderingKHR ? dd->d.CmdEndRenderingKHR : dd->d.CmdEndRendering)(cb);
+      RecordSnapshot(dd, cb, st->bbImg, st->bbLayout);
+      (st->bbKhr && dd->d.CmdBeginRenderingKHR ? dd->d.CmdBeginRenderingKHR : dd->d.CmdBeginRendering)(cb, &st->bbInfo);
+      break;
+    }
+  }
+  for (uint32_t k = done; k < n; ++k) st->draws += draws[k];
+  if (done < n) dd->d.CmdExecuteCommands(cb, n - done, cbs + done);
+}
+void NoteTransfer(DeviceData* dd, VkImage src, VkImage dst) {
+  if (!dd->depthMode) return;
+  std::lock_guard<std::mutex> l(dd->depthLock);
+  if (dd->traceFrames.load() > 0)
+    Log(1, "  transfer %p -> %p%s", (void*)src, (void*)dst, dd->presentedImgs.count(dst) ? " (PRESENTED)" : "");
+  if (dd->presentedImgs.count(dst)) {
+    VoteBackbufferLocked(dd, src);
+    dd->snapDone = false;
+    dd->bbFilled = false;
+  }
+  if (dst && dst == dd->bbImg) dd->bbFilled = true;
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+                                             VkImageLayout dl, uint32_t n, const VkImageCopy* r) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, src, dst);
+  t.dd->d.CmdCopyImage(cb, src, sl, dst, dl, n, r);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+                                             VkImageLayout dl, uint32_t n, const VkImageBlit* r, VkFilter f) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, src, dst);
+  t.dd->d.CmdBlitImage(cb, src, sl, dst, dl, n, r, f);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+                                                VkImageLayout dl, uint32_t n, const VkImageResolve* r) {
+  TlsCb& t = CbState(cb);
+  if (t.dd->traceFrames.load() > 0) Log(1, "  resolve %p -> %p", (void*)src, (void*)dst);
+  NoteTransfer(t.dd, src, dst);
+  t.dd->d.CmdResolveImage(cb, src, sl, dst, dl, n, r);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdResolveImage2(VkCommandBuffer cb, const VkResolveImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  if (t.dd->traceFrames.load() > 0) Log(1, "  resolve %p -> %p", (void*)i->srcImage, (void*)i->dstImage);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdResolveImage2 ? t.dd->d.CmdResolveImage2 : t.dd->d.CmdResolveImage2KHR)(cb, i);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdResolveImage2KHR(VkCommandBuffer cb, const VkResolveImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  if (t.dd->traceFrames.load() > 0) Log(1, "  resolve %p -> %p", (void*)i->srcImage, (void*)i->dstImage);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdResolveImage2KHR ? t.dd->d.CmdResolveImage2KHR : t.dd->d.CmdResolveImage2)(cb, i);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdCopyImage2(VkCommandBuffer cb, const VkCopyImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdCopyImage2 ? t.dd->d.CmdCopyImage2 : t.dd->d.CmdCopyImage2KHR)(cb, i);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdCopyImage2KHR(VkCommandBuffer cb, const VkCopyImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdCopyImage2KHR ? t.dd->d.CmdCopyImage2KHR : t.dd->d.CmdCopyImage2)(cb, i);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdBlitImage2(VkCommandBuffer cb, const VkBlitImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdBlitImage2 ? t.dd->d.CmdBlitImage2 : t.dd->d.CmdBlitImage2KHR)(cb, i);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdBlitImage2KHR(VkCommandBuffer cb, const VkBlitImageInfo2* i) {
+  TlsCb& t = CbState(cb);
+  NoteTransfer(t.dd, i->srcImage, i->dstImage);
+  (t.dd->d.CmdBlitImage2KHR ? t.dd->d.CmdBlitImage2KHR : t.dd->d.CmdBlitImage2)(cb, i);
+}
+
+
+// diagnostics (Ctrl+Shift+F11 in depth / hybrid): the passes of one frame in the log
+std::string DescribeImage(DeviceData* dd, VkImageView view, bool depth) {
+  char buf[160];
+  std::lock_guard<std::mutex> l(dd->depthLock);
+  if (depth) {
+    auto v = dd->depthViews.find(view);
+    if (v == dd->depthViews.end()) return "depth ?";
+    auto im = dd->depthImgs.find(v->second.img);
+    if (im == dd->depthImgs.end()) return "depth ?";
+    snprintf(buf, sizeof(buf), "depth %ux%u fmt %d img %p", im->second.ext.width, im->second.ext.height,
+             int(im->second.fmt), (void*)v->second.img);
+    return buf;
+  }
+  auto v = dd->colorViews.find(view);
+  if (v == dd->colorViews.end()) {
+    snprintf(buf, sizeof(buf), "colour ? (view %p)", (void*)view);
+    return buf;
+  }
+  if (dd->presentedImgs.count(v->second)) return "PRESENTED";
+  auto im = dd->colorImgs.find(v->second);
+  if (im == dd->colorImgs.end()) return "colour ?";
+  snprintf(buf, sizeof(buf), "colour %ux%u fmt %d x%u img %p%s", im->second.ext.width, im->second.ext.height,
+           int(im->second.fmt), im->second.samples, (void*)v->second, v->second == dd->bbImg ? " (back buffer)" : "");
+  return buf;
+}
+void TracePass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri) {
+  DeviceData* dd = t.dd;
+  if (dd->traceFrames.load() <= 0) return;
+  std::string line = "  pass";
+  char buf[64];
+  snprintf(buf, sizeof(buf), " cb %p flags %u:", (void*)cb, ri->flags);
+  line += buf;
+  for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i)
+    if (ri->pColorAttachments[i].imageView)
+      line += " [" + DescribeImage(dd, ri->pColorAttachments[i].imageView, false) + " load " +
+              std::to_string(int(ri->pColorAttachments[i].loadOp)) +
+              (ri->pColorAttachments[i].resolveMode && ri->pColorAttachments[i].resolveImageView
+                   ? " -> resolved into " + DescribeImage(dd, ri->pColorAttachments[i].resolveImageView, false)
+                   : std::string()) + "]";
+  if (ri->pDepthAttachment && ri->pDepthAttachment->imageView)
+    line += " [" + DescribeImage(dd, ri->pDepthAttachment->imageView, true) + " load " +
+            std::to_string(int(ri->pDepthAttachment->loadOp)) + " layout " +
+            std::to_string(int(ri->pDepthAttachment->imageLayout)) + "]";
+  if (t.st->active) line += " SCENE-DEPTH stage " + std::to_string(dd->calibGroup.load());
+  Log(1, "%s", line.c_str());
+}
+void TraceEnd(TlsCb& t) {
+  if (t.dd->traceFrames.load() > 0) Log(1, "    end: %u draws", t.st->draws);
+}
 // before the game's pass begins: projection samples on (tagged with the stage) for the scene's passes,
 // off for the other passes with a depth buffer (shadow maps, reflections: other cameras). Written only
 // when the value changes in this command buffer: every write costs a full pipeline barrier.
 void CalibBeforePass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri) {
   CbDepth& st = *t.st;
   DeviceData* dd = t.dd;
+  // the game is about to clear (or replace) the scene depth: copy the previous stage first
+  if (st.pending && ri->pDepthAttachment && ri->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD &&
+      !(ri->flags & VK_RENDERING_RESUMING_BIT)) {
+    bool same;
+    {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      auto v = dd->depthViews.find(ri->pDepthAttachment->imageView);  // (same image?)
+      same = v != dd->depthViews.end() && v->second.img == st.pImg;
+    }
+    if (same) FlushDepthCopy(dd, cb, st);
+  }
   if ((ri->flags & VK_RENDERING_RESUMING_BIT) || !dd->canCalib || !dd->paramBuf) return;
   int want;
   const uint64_t main = dd->mainClass.load();
@@ -983,27 +1507,65 @@ void CalibBeforePass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri) {
   st.flag = want;
 }
 
+VKAPI_ATTR void VKAPI_CALL hook_CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src,
+                                                   VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t mc,
+                                                   const VkMemoryBarrier* mb, uint32_t bc,
+                                                   const VkBufferMemoryBarrier* bb, uint32_t ic,
+                                                   const VkImageMemoryBarrier* ib) {
+  TlsCb& t = CbState(cb);
+  for (uint32_t i = 0; i < ic; ++i) NoteDepthBarrier(*t.st, ib[i].image, ib[i].oldLayout, ib[i].newLayout);
+  t.dd->d.CmdPipelineBarrier(cb, src, dst, dep, mc, mb, bc, bb, ic, ib);
+}
+void NoteDependency(TlsCb& t, const VkDependencyInfo* di) {
+  for (uint32_t i = 0; di && i < di->imageMemoryBarrierCount; ++i)
+    NoteDepthBarrier(*t.st, di->pImageMemoryBarriers[i].image, di->pImageMemoryBarriers[i].oldLayout,
+                     di->pImageMemoryBarriers[i].newLayout);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* di) {
+  TlsCb& t = CbState(cb);
+  NoteDependency(t, di);
+  (t.dd->d.CmdPipelineBarrier2 ? t.dd->d.CmdPipelineBarrier2 : t.dd->d.CmdPipelineBarrier2KHR)(cb, di);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo* di) {
+  TlsCb& t = CbState(cb);
+  NoteDependency(t, di);
+  (t.dd->d.CmdPipelineBarrier2KHR ? t.dd->d.CmdPipelineBarrier2KHR : t.dd->d.CmdPipelineBarrier2)(cb, di);
+}
+VKAPI_ATTR VkResult VKAPI_CALL hook_EndCommandBuffer(VkCommandBuffer cb) {
+  TlsCb& t = CbState(cb);
+  if (t.dd->depthMode) FlushDepthCopy(t.dd, cb, *t.st);  // the last stage of the frame
+  return t.dd->d.EndCommandBuffer(cb);
+}
+
 VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
   TlsCb& t = CbState(cb);
   BeginRenderingCommon(t, ri);
   CalibBeforePass(t, cb, ri);
+  NoteColorPass(t, cb, ri, false);
+  TracePass(t, cb, ri);
   t.dd->d.CmdBeginRendering(cb, ri);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* ri) {
   TlsCb& t = CbState(cb);
   BeginRenderingCommon(t, ri);
   CalibBeforePass(t, cb, ri);
+  NoteColorPass(t, cb, ri, true);
+  TracePass(t, cb, ri);
   (t.dd->d.CmdBeginRenderingKHR ? t.dd->d.CmdBeginRenderingKHR : t.dd->d.CmdBeginRendering)(cb, ri);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdEndRendering(VkCommandBuffer cb) {
   TlsCb& t = CbState(cb);
   t.dd->d.CmdEndRendering(cb);
+  TraceEnd(t);
   EndRenderingCommon(t, cb);
+  AfterColorPass(t, cb);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdEndRenderingKHR(VkCommandBuffer cb) {
   TlsCb& t = CbState(cb);
   (t.dd->d.CmdEndRenderingKHR ? t.dd->d.CmdEndRenderingKHR : t.dd->d.CmdEndRendering)(cb);
+  TraceEnd(t);
   EndRenderingCommon(t, cb);
+  AfterColorPass(t, cb);
 }
 void NoteRenderPass(DeviceData* dd) {
   if (!dd->loggedRenderPass.exchange(true))
@@ -1056,35 +1618,41 @@ VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportWithCountEXT(VkCommandBuffer cb, u
 
 VKAPI_ATTR void VKAPI_CALL hook_CmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   ++t.st->draws;
   t.dd->d.CmdDraw(cb, vc, ic, fv, fi);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdDrawIndexed(VkCommandBuffer cb, uint32_t ic, uint32_t inst, uint32_t fi, int32_t vo,
                                                uint32_t fin) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   ++t.st->draws;
   t.dd->d.CmdDrawIndexed(cb, ic, inst, fi, vo, fin);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   t.st->draws += std::max(1u, n);
   t.dd->d.CmdDrawIndirect(cb, b, o, n, s);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n,
                                                        uint32_t s) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   t.st->draws += std::max(1u, n);
   t.dd->d.CmdDrawIndexedIndirect(cb, b, o, n, s);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer cbuf,
                                                      VkDeviceSize co, uint32_t mx, uint32_t s) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   t.st->draws += 8;  // count unknown on the CPU
   t.dd->d.CmdDrawIndirectCount(cb, b, o, cbuf, co, mx, s);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o,
                                                             VkBuffer cbuf, VkDeviceSize co, uint32_t mx, uint32_t s) {
   TlsCb& t = CbState(cb);
+  BeforeDraw(t, cb);
   t.st->draws += 8;
   t.dd->d.CmdDrawIndexedIndirectCount(cb, b, o, cbuf, co, mx, s);
 }
@@ -1146,7 +1714,10 @@ void FitStage(DeviceData* dd, DeviceData::Proj& P, std::vector<std::pair<double,
       }
       return;
     }
-    if (best < std::max<size_t>(6, pts.size() * 3 / 10) || ++P.switchVotes < 4) return;
+    // the camera of a stage can change from one frame to the next (EDF 6 does not clear its depth
+    // the same number of times every frame): switch at once when the samples clearly say so
+    bool clear = best >= std::max<size_t>(8, pts.size() * 6 / 10) && cur * 4 < pts.size();
+    if (!clear && (best < std::max<size_t>(6, pts.size() * 3 / 10) || ++P.switchVotes < 3)) return;
   } else if (best < std::max<size_t>(6, pts.size() * 3 / 10) || std::fabs(bB) < 1e-9) {
     return;
   }
@@ -1853,6 +2424,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_BeginCommandBuffer(VkCommandBuffer cb, const
   DeviceData* dd = Dev(cb);
   if (dd->depthMode) {  // a new recording: what params.flags holds when it runs is not known
     CbState(cb).st->flag = -1;
+    CbState(cb).st->pending = false;
+    if (bi->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) CbState(cb).st->draws = 0;  // (secondary)
     return dd->d.BeginCommandBuffer(cb, bi);
   }
   if (!dd->replay && !dd->warmupPending) return dd->d.BeginCommandBuffer(cb, bi);
@@ -2761,6 +3334,10 @@ void DestroySwapchainResources(DeviceData* dd, Swapchain* sc) {
     if (v.cmd) dd->d.FreeCommandBuffers(dev, sc->pool, 1, &v.cmd);
     if (v.cmd2) dd->d.FreeCommandBuffers(dev, sc->pool, 1, &v.cmd2);
     if (v.fence) dd->d.DestroyFence(dev, v.fence, nullptr);
+    if (v.image) {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      dd->presentedImgs.erase(v.image);
+    }
     if (v.image) dd->d.DestroyImage(dev, v.image, nullptr);
     if (v.mem) dd->d.FreeMemory(dev, v.mem, nullptr);
   }
@@ -2908,7 +3485,31 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateSwapchainKHR(VkDevice device, const Vk
   sc->formatDiffers = realFormat != ci->imageFormat;
   sc->onOwn = useOwn;
   sc->vext = ci->imageExtent;
-  if (dd->depthMode) EnsureDepthBuffer(dd, sc->vext);
+  if (dd->depthMode) {
+    EnsureDepthBuffer(dd, sc->vext);
+    // HUD separation: the copy of the scene without HUD (the game's back buffer, 4 bytes per pixel)
+    VkDeviceSize snapNeed = VkDeviceSize(sc->vext.width) * sc->vext.height * 4;
+    VkBuffer nb = VK_NULL_HANDLE;
+    VkDeviceMemory nm = VK_NULL_HANDLE;
+    VkDeviceAddress na = 0;
+    bool grow = dd->snapSize < snapNeed;
+    if (grow && !CreateDevBuf(dd, snapNeed, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              &nb, &nm, &na))
+      grow = false;
+    std::lock_guard<std::mutex> l(dd->depthLock);
+    dd->gameExt = sc->vext;
+    dd->scFormat = sc->format;
+    if (grow) {
+      if (dd->snapBuf) dd->retiredBufs.push_back({dd->snapBuf, dd->snapMem});
+      dd->snapBuf = nb;
+      dd->snapMem = nm;
+      dd->snapAddr = na;
+      dd->snapSize = snapNeed;
+    }
+    dd->bbImg = dd->bbCand = dd->lastColorImg = VK_NULL_HANDLE;  // learnt again for this swapchain
+    dd->bbUsable = false;
+    dd->bbVotes = 0;
+  }
   sc->rext = rext;
   sc->srcOff = {0, 0};
   sc->srcExt = sc->vext;
@@ -2980,6 +3581,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateSwapchainKHR(VkDevice device, const Vk
   sc->v.resize(count);
   for (auto& v : sc->v) {
     ok &= CreateImageMem(dd, ici, &v.image, &v.mem);
+    if (dd->depthMode && v.image) {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      dd->presentedImgs.insert(v.image);
+    }
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     ok &= dd->d.CreateFence(device, &fci, nullptr, &v.fence) == VK_SUCCESS;
@@ -3796,14 +4401,23 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
   }
   if (Cfg().zoom != sc->lastZoom) ComputeRects(sc);
   const bool synth = EnsureSynth(dd, sc);
-  if (frame >= dd->lastFitFrame + 15 || !dd->proj[dd->lastCopyGroup & 3].ok) {
+  if (frame >= dd->lastFitFrame + 3 || !dd->proj[dd->lastCopyGroup & 3].ok) {
     FitProjection(dd);
-    UpdateMainDepthClass(dd);
     dd->lastFitFrame = frame;
   }
+  if (frame >= dd->lastClassFrame + 15) {
+    UpdateMainDepthClass(dd);
+    dd->lastClassFrame = frame;
+  }
   Capture cap;
-  BeginCapture(dd, sc, cap, frame);
+  if (dd->traceFrames.load() > 0 && --dd->traceFrames == 0) Log(1, "---- end of the pass trace");
+  if (BeginCapture(dd, sc, cap, frame)) {
+    dd->traceFrames = 2;
+    Log(1, "---- pass trace of the next frame (Ctrl+Shift+F11):");
+  }
   dd->calibGroup = 0;  // the next frame's scene stages count from 0
+  const uint32_t copied = dd->copiedStages.exchange(0);
+  const bool snapOk = dd->snapFrameOk.exchange(false);  // the scene without HUD was copied this frame
 
   dd->stage = "present(depth): waiting for previous copy";
   dd->d.WaitForFences(dd->device, 1, &vi.fence, VK_TRUE, UINT64_MAX);
@@ -3846,13 +4460,69 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
     pc.outc = sc->workAddr + px * 3;
     pc.meta = dd->metaAddr;
     pc.prev = sc->workAddr + px * 5;
+    pc.stats = dd->paramAddr + kStatsOffset;
+    {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      if (dd->snapBad && frame >= dd->snapBadUntil) dd->snapBad = false;  // try again now and then
+      pc.snap = dd->snapAddr;
+      pc.snapFlags = (snapOk && dd->bbUsable && !dd->snapBad ? 1u : 0u) | (dd->bbSwapRB ? 2u : 0u);
+      if ((pc.snapFlags & 1u) && !dd->loggedSnap) {
+        dd->loggedSnap = true;
+        Log(1, "HUD separation: on (scene copied before the HUD; the HUD stays on the screen plane)");
+      }
+    }
     pc.W = W;
     pc.H = H;
-    // the projection of the scene stage that this frame's depth copy holds
-    const DeviceData::Proj& pj = dd->proj[dd->lastCopyGroup & 3];
-    bool on = pj.ok && pc.depth && dd->depthCopies.load() > 0 && fresh;
-    pc.a = pj.A;
-    pc.b = on ? pj.B : 0.0f;  // b = 0: no depth yet, both eyes = the game image
+    // the stages copied in this frame that have a known projection: the shader combines them
+    uint32_t stages = copied, metaTail[11] = {};
+    VkDeviceSize strideBytes;
+    {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      strideBytes = dd->depthCap;
+    }
+    for (uint32_t g = 0; g < 4; ++g) {
+      const DeviceData::Proj& pj = dd->proj[g];
+      if (!pj.ok) stages &= ~(1u << g);
+      memcpy(&metaTail[g], &pj.A, 4);
+      memcpy(&metaTail[4 + g], &pj.B, 4);
+    }
+    metaTail[8] = stages;
+    metaTail[9] = uint32_t(strideBytes / 4);
+    // orientation: compare how many depth edges also are colour edges, as is and upside down
+    if (dd->paramMap && frame >= dd->lastFlipCheck + 30) {
+      dd->lastFlipCheck = frame;
+      volatile uint32_t* st = (volatile uint32_t*)((char*)dd->paramMap + kStatsOffset);
+      uint32_t eA = st[0], hA = st[1], eB = st[2], hB = st[3], sTot = st[4], sHud = st[5];
+      st[0] = st[1] = st[2] = st[3] = st[4] = st[5] = 0;
+      // HUD separation sanity: the "HUD" (what changed after the copy) must be a small part of the image,
+      // else this game does not draw "scene, then HUD" into its back buffer
+      if (sTot >= 200 && sHud * 10 > sTot * 4) {
+        std::lock_guard<std::mutex> l(dd->depthLock);
+        if (!dd->snapBad)
+          Log(1, "HUD separation: off for now (%.0f%% of the image changed after the copy: not a scene + HUD back buffer)",
+              100.0 * sHud / sTot);
+        dd->snapBad = true;
+        dd->snapBadUntil = frame + 1800;
+        dd->loggedSnap = false;
+      }
+      if (eA >= 200 && eB >= 200) {
+        double rA = double(hA) / eA, rB = double(hB) / eB;
+        int vote = rB > rA * 1.3 + 0.02 ? 1 : rA > rB * 1.3 + 0.02 ? 0 : -1;
+        if (vote < 0 || uint32_t(vote) == dd->depthFlip) {
+          dd->flipVotes = 0;
+        } else if (++dd->flipVotes >= 3) {
+          dd->depthFlip = uint32_t(vote);
+          dd->flipVotes = 0;
+          Log(1, "depth mode: the depth buffer is %s (edges matching the image: %.0f%% as is, %.0f%% flipped)",
+              vote ? "upside down: flipped" : "upright", rA * 100, rB * 100);
+        }
+      }
+    }
+    metaTail[10] = dd->depthFlip;
+    dd->d.CmdUpdateBuffer(cb, dd->metaBuf, 64, sizeof(metaTail), metaTail);
+    bool on = stages != 0 && pc.depth && dd->depthCopies.load() > 0 && fresh;
+    pc.a = 0.0f;
+    pc.b = on ? 1.0f : 0.0f;  // 0: no depth this frame, both eyes = the game image
     pc.kL = EyeK(0);
     pc.kR = EyeK(1);
     if (dd->hybrid) {  // shifts relative to the eye the image was rendered for
@@ -3862,7 +4532,9 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
       pc.hyb = (sc->prevValid[otherEye] ? 1u : 0u) | (sc->prevValid[realEye] ? 2u : 0u) | (uint32_t(realEye) << 4);
     }
     pc.conv = Cfg().convergence;
-    pc.maxShift = float(W) * (dd->hybrid ? 0.2f : 0.1f);
+    // (hybrid: from one eye to the other; objects very close to the camera need big shifts, and a
+    // clamped shift would not match the real eye: they would tremble)
+    pc.maxShift = float(W) * (dd->hybrid ? 0.5f : 0.1f);
     static const bool show = getenv("NV3D_DEPTH_SHOW") && getenv("NV3D_DEPTH_SHOW")[0] == '1';
     if (show) pc.maxShift = -1.0f;  // debug: show the captured depth
     const bool compute = !dd->hybrid || on || show;
@@ -4161,7 +4833,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_QueuePresentKHR(VkQueue queue, const VkPrese
   X(CmdBeginRenderingKHR) X(CmdEndRendering) X(CmdEndRenderingKHR) X(CmdBeginRenderPass)         \
   X(CmdBeginRenderPass2) X(CmdDraw) X(CmdDrawIndexed) X(CmdDrawIndirect) X(CmdDrawIndexedIndirect) \
   X(CmdDrawIndirectCount) X(CmdDrawIndexedIndirectCount) X(CmdSetViewport) X(CmdSetViewportWithCount)   \
-  X(CmdSetViewportWithCountEXT) X(BeginCommandBuffer)
+  X(CmdSetViewportWithCountEXT) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier)       \
+  X(CmdPipelineBarrier2) X(CmdPipelineBarrier2KHR) X(CmdCopyImage) X(CmdBlitImage) X(CmdCopyImage2)  \
+  X(CmdCopyImage2KHR) X(CmdBlitImage2) X(CmdBlitImage2KHR) X(CmdResolveImage) X(CmdResolveImage2)    \
+  X(CmdResolveImage2KHR) X(CmdExecuteCommands)
 
 PFN_vkVoidFunction DeviceHook(const char* name) {
 #define CHECK(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)&hook_##n;

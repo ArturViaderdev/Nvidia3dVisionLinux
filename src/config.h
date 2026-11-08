@@ -42,6 +42,7 @@ struct Config {
   float recordFps = 60.0f;     // constant frame rate of the recording
   bool recordAtStart = false;  // start recording as soon as the game shows (NV3D_RECORD=1)
   int inputLayout = 0;         // 0 game (render each eye), 1 SBS input (left/right halves), 2 top-bottom input
+  bool hudSeparation = false;  // depth/hybrid: rebuild the eyes from a copy of the scene taken before the HUD (experimental)
   bool dumpShaders = false;    // save every shader (SPIR-V) the game creates to ~/.cache/3dvision/shaders/<game>
   int fixShadows = 2;          // screen-space position rebuilds corrected (Unreal shadows): 0 off, 1 on, 2 auto
   bool fixShadowsOn = true;    // runtime switch (Ctrl+Shift+Pause) to compare with / without

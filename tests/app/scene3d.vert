@@ -10,12 +10,13 @@ void main() {
   const float xoff[4] = float[](0.0, -0.35, 0.05, 0.45);
   const vec3 cols[4] = vec3[](vec3(0.9, 0.9, 0.9), vec3(1, 0.2, 0.2), vec3(0.2, 1, 0.2), vec3(0.3, 0.4, 1));
   int q = gl_VertexIndex / 6, v = gl_VertexIndex % 6;
-  float w = depth[q];
+  float w = depth[q] + (q == 0 ? c[v].x * 6.0 : 0.0);  // the wall is tilted: varied depths
   vec2 p = c[v] * size[q];                      // view space (x right, y up), units at distance w
   p.x += float(gl_InstanceIndex & 65535) * 1.0e-5;      // instances: many vertices for the projection samples
   float t = float((gl_InstanceIndex & 65535) / 256);       // APP_MOVE=1: the frame number comes in the instance
   float move = q > 0 ? 0.25 * sin(t * 0.07 + float(q)) : 0.0;
-  vec2 ndc = vec2(p.x / w * 1.0 + xoff[q] + move, -p.y / w * 1.7778);
+  const float yoff[4] = float[](0.0, 0.35, -0.25, 0.1);  // not symmetric: upside down is different
+  vec2 ndc = vec2(p.x / w * 1.0 + xoff[q] + move, -p.y / w * 1.7778 + yoff[q]);
   // APP_STAGES=1: instances >= 65536 belong to a "far stage" drawn with another camera
   // (near 20, far 2000), like games that draw far and near scenery separately
   bool farStage = gl_InstanceIndex >= 65536;
