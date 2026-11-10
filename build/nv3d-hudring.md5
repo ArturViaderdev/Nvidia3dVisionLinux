@@ -1,0 +1,10 @@
+32005e5880036d88ee3815c7a67969e0  src/layer.cpp
+df84fdb769a7bc84583bcabc82b8ef06  src/config.cpp
+13a337a7b2befbaabb0cb742f9c39978  src/config.h
+3927a29bb7f1c34681afe5eb018ea77a  src/shaders/depth3d.comp
+0ccb6953ef9c328ee28556fea2603431  src/shaders/gen.sh
+44daa27d1b7f4d09ac30d1b113b9968e  src/depth3d_spv.h
+3af720ccf761a60ef48e2b0ef278d79a  tests/app/app.cpp
+7cfccdc81856112e13874db183cfbce1  README.md
+7c86f622014953bca93913fcb63a80b8  default.conf.example
+2402c23ad26bfb552ee09027b5b85a65  build/lib3dvision_layer32.so

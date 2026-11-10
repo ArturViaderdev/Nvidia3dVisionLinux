@@ -11,6 +11,7 @@
 #include "col.frag.h"
 #include "hud.vert.h"
 #include "hud2.vert.h"
+#include "panel.vert.h"
 #include "comp.frag.h"
 #include "comp.vert.h"
 #include "scene.vert.h"
@@ -201,6 +202,8 @@ int main(int argc, char** argv) {
   CK(vkCreatePipelineLayout(dev, &plci, nullptr, &pl));
   VkPipelineLayout layoutFor = pl;  // (APP_DXVK: the composite pipeline samples the scene)
   VkSampleCountFlagBits samplesFor = VK_SAMPLE_COUNT_1_BIT;  // (APP_DXVK=2: the HUD target is 4x MSAA)
+  VkFormat fmtFor = viewFmt;
+  bool blendFor = false;  // (APP_PANEL: dst * 0.5 + src)  // (APP_BB10=1: the back buffer is 10-bit, as in Unreal games)
   auto pipe = [&](VkShaderModule vs, VkShaderModule fs, bool ztest, bool withDepth) {
     VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -217,13 +220,21 @@ int main(int argc, char** argv) {
     ms.rasterizationSamples = samplesFor;
     VkPipelineColorBlendAttachmentState cba{};
     cba.colorWriteMask = 0xF;
+    if (blendFor) {
+      cba.blendEnable = VK_TRUE;
+      cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; cba.dstColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+      cba.colorBlendOp = VK_BLEND_OP_ADD;
+      cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
+    cb.blendConstants[0] = cb.blendConstants[1] = cb.blendConstants[2] = cb.blendConstants[3] = 0.5f;
     VkDynamicState ds[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = 2; dy.pDynamicStates = ds;
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &viewFmt;
+    ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &fmtFor;
     if (withDepth) ri.depthAttachmentFormat = dfmt;
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     dss.depthTestEnable = ztest; dss.depthWriteEnable = ztest; dss.depthCompareOp = VK_COMPARE_OP_LESS;
@@ -245,7 +256,7 @@ int main(int argc, char** argv) {
   const bool dxvk = dxvkMode > 0;
   VkImage msImg = VK_NULL_HANDLE;
   VkImageView msView = VK_NULL_HANDLE;
-  VkPipeline pComp = VK_NULL_HANDLE, pHudBB = VK_NULL_HANDLE, pHud2BB = VK_NULL_HANDLE;
+  VkPipeline pComp = VK_NULL_HANDLE, pHudBB = VK_NULL_HANDLE, pHud2BB = VK_NULL_HANDLE, pPanelBB = VK_NULL_HANDLE;
   VkImage sceneImg = VK_NULL_HANDLE, bbImg = VK_NULL_HANDLE;
   VkImageView sceneView = VK_NULL_HANDLE, bbView = VK_NULL_HANDLE;
   VkDescriptorSet dset = VK_NULL_HANDLE;
@@ -253,10 +264,13 @@ int main(int argc, char** argv) {
   if (dxvk) {
     VkPhysicalDeviceMemoryProperties mp2;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp2);
-    auto mkImg = [&](VkImage* im, VkImageView* vw, VkImageUsageFlags usage, VkSampleCountFlagBits smp = VK_SAMPLE_COUNT_1_BIT) {
+    const bool bb10 = getenv("APP_BB10") && getenv("APP_BB10")[0] == '1';
+    const VkFormat bbFmt = bb10 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : viewFmt;
+    auto mkImg = [&](VkImage* im, VkImageView* vw, VkImageUsageFlags usage, VkSampleCountFlagBits smp = VK_SAMPLE_COUNT_1_BIT,
+                     bool ten = false) {
       VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-      ic.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-      ic.imageType = VK_IMAGE_TYPE_2D; ic.format = VK_FORMAT_B8G8R8A8_UNORM; ic.extent = {ext.width, ext.height, 1};
+      ic.flags = ten ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      ic.imageType = VK_IMAGE_TYPE_2D; ic.format = ten ? bbFmt : VK_FORMAT_B8G8R8A8_UNORM; ic.extent = {ext.width, ext.height, 1};
       ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = smp; ic.usage = usage;
       CK(vkCreateImage(dev, &ic, nullptr, im));
       VkMemoryRequirements mr;
@@ -269,12 +283,12 @@ int main(int argc, char** argv) {
       CK(vkAllocateMemory(dev, &ma, nullptr, &m));
       vkBindImageMemory(dev, *im, m, 0);
       VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-      v.image = *im; v.viewType = VK_IMAGE_VIEW_TYPE_2D; v.format = viewFmt;
+      v.image = *im; v.viewType = VK_IMAGE_VIEW_TYPE_2D; v.format = ten ? bbFmt : viewFmt;
       v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
       CK(vkCreateImageView(dev, &v, nullptr, vw));
     };
     mkImg(&sceneImg, &sceneView, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    mkImg(&bbImg, &bbView, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    mkImg(&bbImg, &bbView, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SAMPLE_COUNT_1_BIT, bb10);
     if (dxvkMode >= 2) mkImg(&msImg, &msView, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SAMPLE_COUNT_4_BIT);
     VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -302,11 +316,16 @@ int main(int argc, char** argv) {
     vkUpdateDescriptorSets(dev, 1, &wd, 0, nullptr);
     layoutFor = compLayout;
     if (dxvkMode >= 2) samplesFor = VK_SAMPLE_COUNT_4_BIT;
+    if (bb10) fmtFor = bbFmt;
     pComp = pipe(mod(spv_comp_vert, sizeof(spv_comp_vert)), mod(spv_comp_frag, sizeof(spv_comp_frag)), false, false);
     layoutFor = pl;
     pHudBB = pipe(vsH, fs, false, false);
     pHud2BB = pipe(mod(spv_hud2_vert, sizeof(spv_hud2_vert)), fs, false, false);
+    blendFor = true;
+    pPanelBB = pipe(mod(spv_panel_vert, sizeof(spv_panel_vert)), fs, false, false);
+    blendFor = false;
     samplesFor = VK_SAMPLE_COUNT_1_BIT;
+    fmtFor = viewFmt;
   }
 
   VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -432,11 +451,15 @@ int main(int argc, char** argv) {
       bri.renderArea = {{0, 0}, ext}; bri.layerCount = 1; bri.colorAttachmentCount = 1; bri.pColorAttachments = &ba;
       vkCmdBeginRendering(cb, &bri);
       vkCmdSetViewport(cb, 0, 1, &vpx); vkCmdSetScissor(cb, 0, 1, &scx);
+      static const bool pre = getenv("APP_PRE") && getenv("APP_PRE")[0] == '1';
+      if (pre) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pHudBB); vkCmdDraw(cb, 6, 1, 0, 0); }  // (draw 1 is not the scene)
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pComp);
       vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, compLayout, 0, 1, &dset, 0, nullptr);
       vkCmdDraw(cb, 3, 1, 0, 0);
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pHudBB); vkCmdDraw(cb, 6, 1, 0, 0);
       if (mv) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pHud2BB); vkCmdDraw(cb, 6, 1, 0, f); }
+      static const bool panel = getenv("APP_PANEL") && getenv("APP_PANEL")[0] == '1';
+      if (panel) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pPanelBB); vkCmdDraw(cb, 6, 1, 0, 0); }
       vkCmdEndRendering(cb);
       // 3. back buffer -> swapchain image
       barrier(bbImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);

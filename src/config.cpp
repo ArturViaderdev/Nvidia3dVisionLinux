@@ -108,6 +108,11 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "skip_repeats") && ParseBool(val, b)) g_cfg.skipRepeats = b;
   else if (!strcmp(key, "dump_shaders") && ParseBool(val, b)) g_cfg.dumpShaders = b;
   else if (!strcmp(key, "hud_separation") && ParseBool(val, b)) g_cfg.hudSeparation = b;
+  else if (!strcmp(key, "flat_menus") && ParseBool(val, b)) g_cfg.flatMenus = b;
+  else if (!strcmp(key, "hud_split")) {
+    if (!strcasecmp(val, "auto")) g_cfg.hudSplit = 0;
+    else if (ParseFloat(val, f)) g_cfg.hudSplit = std::clamp(int(f), 0, 16);
+  }
   else if (!strcmp(key, "fix_shadows")) {
     if (!strcasecmp(val, "auto")) g_cfg.fixShadows = 2;
     else if (ParseBool(val, b)) g_cfg.fixShadows = b ? 1 : 0;
@@ -183,7 +188,7 @@ static void LoadEnv() {
                                 "hide_extensions", "patch_shaders", "log_level", "hotkeys", "emitter",
                                 "emitter_delay_us", "emitter_invert", "emitter_button", "refresh",
                                 "present_images", "test_pattern", "input", "skip_repeats", "shift_shadows", "hide_mesh_shaders", "record_width",
-                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation"};
+                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation", "hud_split", "flat_menus"};
   for (const char* k : kKeys) {
     std::string env = "NV3D_";
     for (const char* c = k; *c; ++c) env += char(toupper(*c));
@@ -268,6 +273,9 @@ void SaveConfig() {
   fprintf(f, "skip_repeats = %d\nshift_shadows = %d\n", g_cfg.skipRepeats, g_cfg.shiftShadows);
   fprintf(f, "fix_shadows = %s\n", g_cfg.fixShadows == 2 ? "auto" : g_cfg.fixShadows ? "1" : "0");
   fprintf(f, "hud_separation = %d\n", g_cfg.hudSeparation ? 1 : 0);
+  if (g_cfg.hudSplit > 0) fprintf(f, "hud_split = %d\n", g_cfg.hudSplit);
+  else fprintf(f, "hud_split = auto\n");
+  fprintf(f, "flat_menus = %d\n", g_cfg.flatMenus ? 1 : 0);
   fclose(f);
   struct stat st;
   if (stat(g_profile.c_str(), &st) == 0) g_profileMtime = st.st_mtime;
@@ -284,15 +292,16 @@ struct X11 {
   unsigned char (*KeysymToKeycode)(void*, unsigned long) = nullptr;
   bool tried = false;
   bool ok = false;
-  unsigned char kc[16] = {};
+  unsigned char kc[32] = {};  // (one per Key below)
 };
 X11 g_x;
 
 enum Key { kCtrlL, kCtrlR, kShiftL, kShiftR, kF3, kF4, kF5, kF6, kF7, kF8, kF9, kF10, kF11,
-           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kF12, kPause, kCount };
+           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kF12, kPause, kScroll, kCount };
+static_assert(kCount <= 32, "X11::kc holds 32 keys");
 const unsigned long kSyms[kCount] = {0xFFE3, 0xFFE4, 0xFFE1, 0xFFE2, 0xFFC0, 0xFFC1, 0xFFC2, 0xFFC3,
                                      0xFFC4, 0xFFC5, 0xFFC6, 0xFFC7, 0xFFC8, 0xFF55, 0xFF56, 0xFF50,
-                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57, 0xFFC9, 0xFF13};
+                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57, 0xFFC9, 0xFF13, 0xFF14};
 bool g_dumpRequested = false;
 bool g_recordToggle = false;
 
@@ -310,7 +319,8 @@ bool InitX11() {
   for (int i = 0; i < kCount; ++i) g_x.kc[i] = g_x.KeysymToKeycode(g_x.dpy, kSyms[i]);
   g_x.ok = true;
   Log(1, "hotkeys: Ctrl+Shift + F3/F4 sep -/+  F5/F6 conv -/+  F7 swap eyes  F8 3D on/off  F9 save  F10 test pattern  "
-         "F11 capture  F12 record video  Ins/Del shutter delay +/-  End shutter invert  PgUp/PgDn zoom  Home zoom=1  F1/F2 HUD depth  Pause shadow fix on/off");
+         "F11 capture  F12 record video  Ins/Del shutter delay +/-  End shutter invert  PgUp/PgDn zoom  Home zoom=1  F1/F2 HUD depth  Pause shadow fix on/off  "
+         "Scroll Lock HUD separation (off / auto / split 1-6)");
   return true;
 }
 
@@ -411,6 +421,15 @@ bool PollControls() {
     g_cfg.fixShadowsOn = !g_cfg.fixShadowsOn;
     changed = true;
     Log(1, "fix_shadows corrections %s", g_cfg.fixShadowsOn ? "ON" : "OFF");
+  }
+  if (pressed(kScroll)) {  // HUD separation: off -> automatic -> after draw 1, 2 ... 6 -> off
+    if (!g_cfg.hudSeparation) g_cfg.hudSeparation = true, g_cfg.hudSplit = 0;
+    else if (g_cfg.hudSplit < 6) ++g_cfg.hudSplit;
+    else g_cfg.hudSeparation = false, g_cfg.hudSplit = 0;
+    changed = true;
+    if (!g_cfg.hudSeparation) Log(1, "HUD separation: off");
+    else if (!g_cfg.hudSplit) Log(1, "HUD separation: on, automatic split point");
+    else Log(1, "HUD separation: on, copy after back buffer draw %d", g_cfg.hudSplit);
   }
   static bool wasAdjusting = false;
   bool adjusting = mod && (cur[kF3] || cur[kF4] || cur[kF5] || cur[kF6] || cur[kPgUp] || cur[kPgDn] || cur[kF1] || cur[kF2]);

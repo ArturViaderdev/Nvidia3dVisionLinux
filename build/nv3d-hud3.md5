@@ -1,0 +1,8 @@
+d44f4042210bf16097df6b937ef51659  src/layer.cpp
+a7fd03061b432f182886e3df76d16b48  src/shaders/depth3d.comp
+c48232411707b75fefa5127284d86550  src/depth3d_spv.h
+5dc857454be5f5aaa894c7ee1b8b23e0  tests/app/app.cpp
+47c3fc8e8e02b5ba6bf238e499214731  tests/app/panel.vert
+095d896067d9d8dbab2a5ab5bca71aef  tests/app/panel.vert.h
+f6444159d6f23974a79bcf9b3dea0368  README.md
+a65e3437b34816acecafc277b830a682  build/lib3dvision_layer32.so

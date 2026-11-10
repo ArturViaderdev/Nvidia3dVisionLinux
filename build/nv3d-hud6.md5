@@ -1,0 +1,9 @@
+b8225e0cbde423c54ded49fba29988e3  src/layer.cpp
+1bc32e510d1ac08ca910e8b0c8191dd8  src/spirv_patch.cpp
+13d6e72f9606f630f4d727587e6a5b39  src/config.cpp
+4d42f8210d5bb3551b03678dc6c555d5  src/config.h
+62807b0421316cd9f24eea825b4ee88e  tests/app/panel.vert
+6f5518ce6ab03d8beaa7a55b9097b800  tests/app/panel.vert.h
+a4d02a8e09ed178b4f2cead6f5f8981c  README.md
+10b5a80780af9098aeaf337b9f36a64d  default.conf.example
+66f3d71b2e462e6613b712ba1814af79  build/lib3dvision_layer32.so

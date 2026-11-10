@@ -248,7 +248,7 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
   // projection samples: only at OpReturn sites (splitting a geometry shader's block around
   // OpEmitVertex could break structured control flow)
   if (isGeometry) calib = false;
-  uint32_t idC3 = fresh(), idHalf = fresh();
+  uint32_t idC3 = fresh(), idHalf = fresh(), idMHalf = fresh(), idZeroF = fresh();
   uint32_t idPtrU64 = 0, idK63 = 0, idK6 = 0, idK255 = 0, idK3 = 0, idK32 = 0, idOff64 = 0, idK7 = 0, idK18 = 0,
            idK26 = 0, idKMul = 0;
   if (calib) {
@@ -303,6 +303,8 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
       Emit(out, OpConstant, {floatType, idOne, 0x3F800000u});
       Emit(out, OpConstant, {idU32, idC3, 3});
       Emit(out, OpConstant, {floatType, idHalf, 0x3F000000u});
+      Emit(out, OpConstant, {floatType, idMHalf, 0xBF000000u});  // -0.5
+      Emit(out, OpConstant, {floatType, idZeroF, 0u});
       if (calib) {
         Emit(out, OpTypePointer, {idPtrU64, StoragePhysicalStorageBuffer, idU64});
         Emit(out, OpConstant, {idU32, idK63, 63});
@@ -327,8 +329,15 @@ PatchResult PatchStereo(const uint32_t* code, size_t n, const char* entryName, u
       ++patchSites;
       uint32_t ptrS = fresh(), pk = fresh(), k = fresh(), pc = fresh(), cv = fresh(), ph = fresh(), hd = fresh();
       Emit(out, OpConvertUToPtr, {idPtrStruct, ptrS, idAddr});
+      // params.flags < 0: the HUD drawn over the finished scene (depth / hybrid HUD separation):
+      // no stereo shift, it stays on the screen plane in both eyes
+      uint32_t k0 = fresh(), pf0 = fresh(), fl0 = fresh(), noShift = fresh();
       Emit(out, OpAccessChain, {idPtrFloat, pk, ptrS, idC0});
-      Emit(out, OpLoad, {floatType, k, pk, MemAligned, 4});
+      Emit(out, OpLoad, {floatType, k0, pk, MemAligned, 4});
+      Emit(out, OpAccessChain, {idPtrFloat, pf0, ptrS, idC3});
+      Emit(out, OpLoad, {floatType, fl0, pf0, MemAligned, 4});
+      Emit(out, OpFOrdLessThan, {idBool, noShift, fl0, idMHalf});
+      Emit(out, OpSelect, {floatType, k, noShift, idZeroF, k0});
       Emit(out, OpAccessChain, {idPtrFloat, pc, ptrS, idC1});
       Emit(out, OpLoad, {floatType, cv, pc, MemAligned, 4});
       Emit(out, OpAccessChain, {idPtrFloat, ph, ptrS, idC2});

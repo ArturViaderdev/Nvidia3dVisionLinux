@@ -3,6 +3,9 @@
 // PASS 1 (resolve): each eye pixel takes the colour of the game pixel that won it; holes
 //                   (background uncovered by the shift) take the farther neighbour, or in hybrid
 //                   mode the last real image of that eye (rendered one frame ago from that eye).
+// PASS 2 (match, before PASS 0, only with HUD separation): which of the last copies of the scene
+//                   (taken before the HUD) belongs to this frame: the one equal to the image outside
+//                   the HUD. Games that record on several threads present frames in another order.
 // Compile: glslangValidator -V --target-env vulkan1.2 -DPASS=0 depth3d.comp (see gen.sh)
 #version 450
 #extension GL_EXT_buffer_reference : require
@@ -26,8 +29,13 @@ layout(push_constant) uniform PC {
                 // bit 4 = the real eye (the colour image belongs to it)
   U32s stats;   // [0..3] orientation test: depth edges / edges also in the colour, normal and flipped;
                 // [4] [5] HUD separation: samples / samples that are HUD
-  U32s snap;    // the game's back buffer before the HUD (the scene alone)
-  uint snapFlags;  // 1 valid, 2 red / blue swapped
+                // [8..10] samples equal to each copy, [11] samples, [12..14] samples where each copy
+                // equals one of the two previous frames' images (this frame, PASS 2)
+                // [16] frames a copy matched, [17] still frames (accumulated, read by the host)
+  U32s snap;    // copies of the game's back buffer before the HUD (the scene alone), snapStride words apart
+  uint snapFlags;  // 1 copies available, 2 red / blue swapped, 4 copies are 10-bit (A2B10G10R10 / A2R10G10B10)
+  uint snapStride;
+  uint snapMask;   // which copy slots hold a recent copy
 } pc;
 
 // colour unchanged (per 8-bit channel) between this frame and the previous real image of the same eye
@@ -93,26 +101,105 @@ uint Diff(uint a, uint b) {
   return max(max(d.x, d.y), max(d.z, d.w));
 }
 
-uint SnapAt(uint i) {
-  uint c = pc.snap.v[i];
+uint SnapIn(uint slot, uint i) {
+  uint c = pc.snap.v[slot * pc.snapStride + i];
+  if ((pc.snapFlags & 4u) != 0u) {  // 10 bits per channel -> 8 (as the presented image has it)
+    uvec3 t = (uvec3(c, c >> 10, c >> 20) & 1023u) * 255u + 511u;
+    t /= 1023u;
+    c = 0xFF000000u | t.x | (t.y << 8) | (t.z << 16);
+  }
   if ((pc.snapFlags & 2u) != 0u) c = (c & 0xFF00FF00u) | ((c & 0xFFu) << 16) | ((c >> 16) & 0xFFu);
   return c;
 }
+#if PASS != 2
+// the copy of this frame: the one most of the image matches (counted by PASS 2), -1 if none does
+int Slot() {
+  if ((pc.snapFlags & 1u) == 0u) return -1;
+  uint n = pc.stats.v[11], best = 0u;
+  int s = -1;
+  for (uint k = 0u; k < 3u; ++k) {
+    if ((pc.snapMask & (1u << k)) == 0u) continue;
+    uint m = pc.stats.v[8u + k];
+    // hybrid: a copy identical to an earlier frame's finished image holds that frame's HUD (taken too
+    // early, before the scene arrived: the back buffer still had the last frame)
+    if ((pc.hyb & 1u) != 0u && pc.stats.v[12u + k] * 200u >= n * 199u) continue;
+    if (m > best) { best = m; s = int(k); }
+  }
+  return (n > 0u && best * 20u >= n * 11u) ? s : -1;  // 55%: the rest may be HUD
+}
+// a copy is identical to this image: nothing was drawn after it, or the image did not change (it
+// tells nothing about where the copy is taken)
+bool StillMatch() {
+  uint n = pc.stats.v[11];
+  for (uint k = 0u; k < 3u; ++k)
+    if ((pc.snapMask & (1u << k)) != 0u && n > 0u && pc.stats.v[8u + k] * 200u >= n * 199u) return true;
+  return false;
+}
+int gSlot = -1;
+uint SnapAt(uint i) { return SnapIn(uint(gSlot), i); }
 // drawn after the scene was copied: HUD, crosshair, markers, menus
 // (the copy and the presented image are the same bytes except where something was drawn after the copy)
-bool HudAt(uint i) { return (pc.snapFlags & 1u) != 0u && Diff(SnapAt(i), pc.color.v[i]) > 2u; }
+bool HudAt(uint i) { return gSlot >= 0 && Diff(SnapAt(i), pc.color.v[i]) > 2u; }
 // the colour the eyes are rebuilt from: the scene without HUD when available
-uint SrcAt(uint i) { return (pc.snapFlags & 1u) != 0u ? SnapAt(i) : pc.color.v[i]; }
+uint SrcAt(uint i) { return gSlot >= 0 ? SnapAt(i) : pc.color.v[i]; }
+#endif
 
 float Luma(uint c) { vec4 v = unpackUnorm4x8(c); return dot(v.rgb, vec3(0.3, 0.59, 0.11)); }
 
+#if PASS == 1
+// A HUD pixel: f = what the game shows, s = the scene there before the HUD, r = the scene this eye
+// sees there (rebuilt). Translucent panels (a darkening or a whitening over the scene) let the scene
+// through: keep the panel but show this eye's scene through it, as f = s*t (+ white*(1-t)); opaque
+// HUD (any other colour change) stays as it is. (Taking f as it is would show the scene behind the
+// panels at the screen depth: rectangles of scene that do not move with it.)
+uint HudOver(uint f, uint s, uint r) {
+  vec3 F = unpackUnorm4x8(f).rgb, S = unpackUnorm4x8(s).rgb, R = unpackUnorm4x8(r).rgb;
+  float lf = dot(F, vec3(0.3, 0.59, 0.11)), ls = dot(S, vec3(0.3, 0.59, 0.11));
+  float t;
+  vec3 model;
+  if (lf <= ls) {
+    t = lf / max(ls, 1.0e-4);
+    model = S * t;
+  } else {
+    t = 1.0 - (lf - ls) / max(1.0 - ls, 1.0e-4);
+    model = vec3(1.0) - (vec3(1.0) - S) * t;
+  }
+  t = clamp(t, 0.0, 1.0);
+  vec3 err = abs(F - model);
+  if (max(max(err.r, err.g), err.b) > 0.12) return f;  // another colour: opaque HUD (a slight tint is a panel)
+  vec3 o = clamp(F + (R - S) * t, 0.0, 1.0);
+  return packUnorm4x8(vec4(o, 1.0));
+}
+#endif
+
 void main() {
+#if PASS == 2
+  // one invocation per sample of a 16-pixel grid
+  uint x = gl_GlobalInvocationID.x * 16u + 8u, y = gl_GlobalInvocationID.y * 16u + 8u;
+  if (x >= pc.W || y >= pc.H) return;
+  uint i = y * pc.W + x, c = pc.color.v[i];
+  // the previous frames' images: in hybrid, the last real image of each eye (frames N-1 and N-2)
+  uint realE = (pc.hyb >> 4) & 1u, p = pc.prev.v[(1u - realE) * pc.W * pc.H + i];
+  uint q = (pc.hyb & 2u) != 0u ? pc.prev.v[realE * pc.W * pc.H + i] : p;
+  atomicAdd(pc.stats.v[11], 1u);
+  for (uint k = 0u; k < 3u; ++k) {
+    if ((pc.snapMask & (1u << k)) == 0u) continue;
+    uint sk = SnapIn(k, i);
+    if (Diff(sk, c) <= 2u) atomicAdd(pc.stats.v[8u + k], 1u);
+    if ((pc.hyb & 1u) != 0u && (Diff(sk, p) <= 2u || Diff(sk, q) <= 2u)) atomicAdd(pc.stats.v[12u + k], 1u);
+  }
+#else
   uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
   if (x >= pc.W || y >= pc.H) return;
   uint WH = pc.W * pc.H;
+  gSlot = Slot();
 #if PASS == 0
   bool have = pc.b != 0.0;
-  if (have && (pc.snapFlags & 1u) != 0u && (x & 7u) == 0u && (y & 7u) == 0u) {
+  if (x == 0u && y == 0u && (pc.snapFlags & 1u) != 0u) {
+    if (gSlot >= 0) atomicAdd(pc.stats.v[16], 1u);
+    else if (StillMatch()) atomicAdd(pc.stats.v[17], 1u);
+  }
+  if (have && gSlot >= 0 && (x & 7u) == 0u && (y & 7u) == 0u) {
     atomicAdd(pc.stats.v[4], 1u);
     if (HudAt(y * pc.W + x)) atomicAdd(pc.stats.v[5], 1u);
   }
@@ -179,15 +266,12 @@ void main() {
       pc.outc.v[row + x] = pc.prev.v[row + x];
       continue;
     }
-    if (HudAt(y * pc.W + x) && (pc.hyb == 0u || e != realE)) {
-      pc.outc.v[row + x] = pc.color.v[y * pc.W + x];  // HUD: on the screen plane, in both eyes
-      continue;
-    }
+    bool hud = HudAt(y * pc.W + x) && (pc.hyb == 0u || e != realE);
     uint key = pc.keys.v[row + x];
     uint sx = x;
     if (key == 0u && (pc.hyb & 1u) != 0u) {
       // hybrid: the uncovered background was really seen by this eye one frame ago
-      pc.outc.v[row + x] = pc.prev.v[row + x];
+      pc.outc.v[row + x] = hud ? pc.color.v[y * pc.W + x] : pc.prev.v[row + x];
       continue;
     }
     if (key == 0u) {
@@ -214,7 +298,11 @@ void main() {
       sx = key & 0xFFFu;
     }
     uint c = SrcAt(y * pc.W + sx);
-    if ((pc.snapFlags & 1u) == 0u && (pc.hyb & 1u) != 0u && e != realE && sx != x) {
+    if (hud) {  // HUD: on the screen plane, in both eyes
+      pc.outc.v[row + x] = HudOver(pc.color.v[y * pc.W + x], SnapAt(y * pc.W + x), c);
+      continue;
+    }
+    if (gSlot < 0 && (pc.hyb & 1u) != 0u && e != realE && sx != x) {
       // HUD, crosshair, markers, menus are drawn after the scene and are not in the depth: they
       // belong on the screen plane. Evidence: the last real image of this eye. If the pixel left
       // where it is matches it much better than the rebuilt one, it is screen-plane content.
@@ -230,5 +318,6 @@ void main() {
     }
     pc.outc.v[row + x] = c;
   }
+#endif
 #endif
 }

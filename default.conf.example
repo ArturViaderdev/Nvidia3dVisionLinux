@@ -106,9 +106,16 @@ log_level = 1
 # en juegos de Unreal (*-Shipping.exe) | 1 = siempre las dos cosas | 0 = nada. Ctrl+Shift+Pausa compara.
 fix_shadows = auto
 
-# depth / hybrid: HUD separation (experimental). The eyes are rebuilt from a copy of the scene taken
-# before the HUD, so the HUD stays on the screen plane. 0 = off (default), 1 = on
+# depth / hybrid: separacion del HUD (experimental). Los ojos se reconstruyen con una copia de la escena
+# tomada antes del HUD, y el HUD queda en el plano de la pantalla. 0 = desactivada (por defecto), 1 = activada
 hud_separation = 0
+# tras que dibujo en el back buffer se toma la copia: auto (empieza en 1 y prueba los siguientes) o 1..16.
+# Ctrl+Shift+Bloq Despl: desactivada -> auto -> 1 ... 6 -> desactivada
+hud_split = auto
+
+# hybrid: pantallas sin escena 3D (titulo, menus, cargas) sin desplazamiento estereo (1), para juegos cuyos
+# menus 2D quedan muy por detras de la pantalla (EDF 6). 0 = como el resto (por defecto)
+flat_menus = 0
 
 # Guardar todos los shaders del juego (SPIR-V) en ~/.cache/3dvision/shaders/<juego> para
 # analizarlos (3dvision-tool shader-fix, 3dvision-shader-scan). Solo para diagnostico.
