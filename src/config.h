@@ -44,7 +44,8 @@ struct Config {
   int inputLayout = 0;         // 0 game (render each eye), 1 SBS input (left/right halves), 2 top-bottom input
   bool hudSeparation = false;  // depth/hybrid: rebuild the eyes from a copy of the scene taken before the HUD (experimental)
   int hudSplit = 0;
-  bool flatMenus = false;      // hybrid: screens without a 3D scene (menus) without stereo shift            // the copy is taken after this draw into the back buffer (0 = automatic)
+  bool flatMenus = false;
+  bool depthNearest = false;   // depth / hybrid: where several scene stages have depth, the nearest wins (else the latest)      // hybrid: screens without a 3D scene (menus) without stereo shift            // the copy is taken after this draw into the back buffer (0 = automatic)
   bool dumpShaders = false;    // save every shader (SPIR-V) the game creates to ~/.cache/3dvision/shaders/<game>
   int fixShadows = 2;          // screen-space position rebuilds corrected (Unreal shadows): 0 off, 1 on, 2 auto
   bool fixShadowsOn = true;    // runtime switch (Ctrl+Shift+Pause) to compare with / without

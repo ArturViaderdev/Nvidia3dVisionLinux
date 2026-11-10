@@ -117,6 +117,10 @@ hud_split = auto
 # menus 2D quedan muy por detras de la pantalla (EDF 6). 0 = como el resto (por defecto)
 flat_menus = 0
 
+# depth / hybrid: donde varias etapas de la escena tienen profundidad gana la ultima (latest, por defecto)
+# o la mas cercana (nearest: capas lejanas dibujadas despues de la escena principal, EDF 6)
+depth_layers = latest
+
 # Guardar todos los shaders del juego (SPIR-V) en ~/.cache/3dvision/shaders/<juego> para
 # analizarlos (3dvision-tool shader-fix, 3dvision-shader-scan). Solo para diagnostico.
 dump_shaders = 0

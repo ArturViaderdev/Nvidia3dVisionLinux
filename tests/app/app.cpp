@@ -155,6 +155,8 @@ int main(int argc, char** argv) {
   VkImage rtImg = VK_NULL_HANDLE;
   VkImageView rtView = VK_NULL_HANDLE;
   VkImageView dview = VK_NULL_HANDLE;
+  VkImage dimg2 = VK_NULL_HANDLE;   // APP_STAGES=3: a second depth image (a layer with its own camera)
+  VkImageView dview2 = VK_NULL_HANDLE;
   if (depth) {
     VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ic.imageType = VK_IMAGE_TYPE_2D; ic.format = dfmt; ic.extent = {sext.width, sext.height, 1};
@@ -177,6 +179,14 @@ int main(int argc, char** argv) {
     v.image = dimg; v.viewType = VK_IMAGE_VIEW_TYPE_2D; v.format = dfmt;
     v.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
     CK(vkCreateImageView(dev, &v, nullptr, &dview));
+    {
+      CK(vkCreateImage(dev, &ic, nullptr, &dimg2));
+      VkDeviceMemory dm2;
+      CK(vkAllocateMemory(dev, &ma, nullptr, &dm2));
+      vkBindImageMemory(dev, dimg2, dm2, 0);
+      v.image = dimg2;
+      CK(vkCreateImageView(dev, &v, nullptr, &dview2));
+    }
     if (unity) {
       VkImageCreateInfo rc = ic;
       rc.format = viewFmt;
@@ -229,7 +239,7 @@ int main(int argc, char** argv) {
     }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
-    cb.blendConstants[0] = cb.blendConstants[1] = cb.blendConstants[2] = cb.blendConstants[3] = 0.5f;
+    cb.blendConstants[0] = cb.blendConstants[1] = cb.blendConstants[2] = cb.blendConstants[3] = 0.35f;
     VkDynamicState ds[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = 2; dy.pDynamicStates = ds;
@@ -264,8 +274,11 @@ int main(int argc, char** argv) {
   if (dxvk) {
     VkPhysicalDeviceMemoryProperties mp2;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp2);
-    const bool bb10 = getenv("APP_BB10") && getenv("APP_BB10")[0] == '1';
-    const VkFormat bbFmt = bb10 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : viewFmt;
+    // APP_BB10=1: 10-bit back buffer; APP_BB_UNORM=1: 8-bit UNORM (no sRGB: blending in the stored values, like EDF 6)
+    const bool bb10 = (getenv("APP_BB10") && getenv("APP_BB10")[0] == '1') ||
+                      (getenv("APP_BB_UNORM") && getenv("APP_BB_UNORM")[0] == '1');
+    const VkFormat bbFmt = getenv("APP_BB10") && getenv("APP_BB10")[0] == '1' ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                           : bb10 ? VK_FORMAT_B8G8R8A8_UNORM : viewFmt;
     auto mkImg = [&](VkImage* im, VkImageView* vw, VkImageUsageFlags usage, VkSampleCountFlagBits smp = VK_SAMPLE_COUNT_1_BIT,
                      bool ten = false) {
       VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -508,7 +521,35 @@ int main(int argc, char** argv) {
     // the depth is cleared again for the near stage (the three quads)
     // APP_STAGES=2: the far stage is skipped every other 30 frames (the near camera's stage number changes)
     static const int stagesMode = depth && getenv("APP_STAGES") ? atoi(getenv("APP_STAGES")) : 0;
-    static const bool stages = stagesMode > 0;
+    static const bool stages = stagesMode > 0 && stagesMode < 3;
+    // APP_STAGES=3 (like EDF 6): the main scene in depth image A (wall + red quad), a layer with
+    // another camera in depth image B (green quad), then more of the main scene in A again (blue quad)
+    if (stagesMode == 3) {
+      static const bool mv3 = getenv("APP_MOVE") && getenv("APP_MOVE")[0] == '1';
+      const uint32_t mi = mv3 ? f * 256 : 0;
+      VkViewport vp0{0, 0, float(ext.width), float(ext.height), 0, 1};
+      VkRect2D sc0{{0, 0}, ext};
+      VkImageMemoryBarrier db2 = b;
+      db2.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db2.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      db2.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      db2.image = dimg2; db2.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+      vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1, &db2);
+      vkCmdBeginRendering(cb, &ri);  // A, cleared: wall + red quad
+      vkCmdSetViewport(cb, 0, 1, &vp0); vkCmdSetScissor(cb, 0, 1, &sc0);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
+      for (int d = 0; d < 8; ++d) vkCmdDraw(cb, 12, 32, 0, d * 32 + mi);
+      vkCmdEndRendering(cb);
+      ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      VkRenderingAttachmentInfo da2 = da;
+      da2.imageView = dview2;
+      VkRenderingInfo ri2 = ri;
+      ri2.pDepthAttachment = &da2;
+      vkCmdBeginRendering(cb, &ri2);  // B, cleared: green quad with the far camera
+      vkCmdSetViewport(cb, 0, 1, &vp0); vkCmdSetScissor(cb, 0, 1, &sc0);
+      for (int d = 0; d < 8; ++d) vkCmdDraw(cb, 6, 32, 12, 65536 + d * 32 + mi);
+      vkCmdEndRendering(cb);
+      da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // A again, kept: blue quad
+    }
     if (stages && !(stagesMode == 2 && (f / 30) % 2 == 1)) {
       vkCmdBeginRendering(cb, &ri);
       VkViewport vp0{0, 0, float(ext.width), float(ext.height), 0, 1};
@@ -534,7 +575,8 @@ int main(int argc, char** argv) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
     static const bool moving = getenv("APP_MOVE") && getenv("APP_MOVE")[0] == '1';
     for (int d = 0; d < (menu ? 0 : depth ? 8 : 1); ++d) {
-      if (stages) vkCmdDraw(cb, 18, 32, 6, d * 32 + (moving ? f * 256 : 0));  // near stage: only the quads
+      if (stagesMode == 3) vkCmdDraw(cb, 6, 32, 18, d * 32 + (moving ? f * 256 : 0));  // A again: the blue quad
+      else if (stages) vkCmdDraw(cb, 18, 32, 6, d * 32 + (moving ? f * 256 : 0));  // near stage: only the quads
       else vkCmdDraw(cb, depth ? 24 : 18, depth ? 32 : 1, 0, depth ? d * 32 + (moving ? f * 256 : 0) : 0);
     }
     if (unity) {

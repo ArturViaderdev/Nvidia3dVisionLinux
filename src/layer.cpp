@@ -294,7 +294,10 @@ struct DeviceData {
   // projection samples are grouped by "stage" of the scene: how many times its depth was cleared
   // in the frame. Some games draw the far scene with one camera, clear the depth and draw the near
   // scene with another (EDF 6): only the last stage is in the depth copy, so only its camera counts.
-  std::atomic<uint32_t> calibGroup{0};     // stage of the pass being recorded (reset every frame)
+  std::atomic<uint32_t> calibGroup{0};     // stages so far in the frame being recorded (reset every frame)
+  VkImage stageImg[4] = {};                // the depth image of each stage (caller holds depthLock)
+  uint32_t curStage = 0;                   // stage of the last scene pass (caller holds depthLock)
+  std::atomic<uint64_t> stageFrameAt{UINT64_MAX};  // (MAX: never)   // last frame whose start was seen in the passes
   std::atomic<uint32_t> lastCopyGroup{0};  // stage of the last depth copy
   std::atomic<uint32_t> copiedStages{0};   // stages whose depth was copied in the frame being recorded
   uint64_t lastClassFrame = 0;
@@ -338,7 +341,7 @@ struct DeviceData {
   std::atomic<bool> snapDone{false}, bbFilled{false};
   std::atomic<uint32_t> bbDraws{0};  // draws (and copies) into the back buffer in this frame so far
   std::atomic<int64_t> lastSnapNs{0};
-  std::atomic<uint64_t> depthFrameAt{0};  // last frame the scene depth was cleared (HUD frame boundary)
+  std::atomic<uint64_t> depthFrameAt{UINT64_MAX};  // (MAX: never)  // last frame the scene depth was cleared (HUD frame boundary)
   std::atomic<uint32_t> snapTaken{0};  // copies taken since the last report
   VkCommandBuffer lastBBcb = VK_NULL_HANDLE;
   bool snapBad = false, loggedSnap = false;
@@ -839,6 +842,7 @@ struct CbDepth {
   VkExtent2D pExt{};
   VkImageLayout pLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint32_t pMip = 0, pLayer = 0, pStage = 0;
+  uint32_t stage = 0;  // scene stage of the current pass
   // the current pass draws into the game's back buffer (HUD separation)
   bool bbPass = false, bbKhr = false, bbCanSplit = false, bbSecondary = false;
   VkImage bbImg = VK_NULL_HANDLE;
@@ -1100,7 +1104,7 @@ void EndRenderingCommon(TlsCb& t, VkCommandBuffer cb) {
     st.pLayout = st.layout;
     st.pMip = st.mip;
     st.pLayer = st.layer;
-    st.pStage = dd->calibGroup.load();
+    st.pStage = st.stage;
   }
 }
 // called by the presenter side every few frames: the class with the most draws is the scene
@@ -1327,7 +1331,7 @@ void NoteColorPass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri, bool
     if (dd->presentedImgs.count(img)) {
       VoteBackbufferLocked(dd, dd->lastColorImg);
       // the game's frame is finished (when there is no scene depth to tell: menus, 2D games)
-      if (dd->frame > dd->depthFrameAt.load() + 10) {
+      if (dd->depthFrameAt.load() == UINT64_MAX || dd->frame > dd->depthFrameAt.load() + 10) {
         dd->snapDone = false;
         dd->bbFilled = false;
         dd->bbDraws = 0;
@@ -1439,7 +1443,7 @@ void NoteTransfer(DeviceData* dd, VkImage src, VkImage dst) {
     Log(1, "  transfer %p -> %p%s", (void*)src, (void*)dst, dd->presentedImgs.count(dst) ? " (PRESENTED)" : "");
   if (dd->presentedImgs.count(dst)) {
     VoteBackbufferLocked(dd, src);
-    if (dd->frame > dd->depthFrameAt.load() + 10) {
+    if (dd->depthFrameAt.load() == UINT64_MAX || dd->frame > dd->depthFrameAt.load() + 10) {
       dd->snapDone = false;
       dd->bbFilled = false;
       dd->bbDraws = 0;
@@ -1546,7 +1550,7 @@ void TracePass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri) {
     line += " [" + DescribeImage(dd, ri->pDepthAttachment->imageView, true) + " load " +
             std::to_string(int(ri->pDepthAttachment->loadOp)) + " layout " +
             std::to_string(int(ri->pDepthAttachment->imageLayout)) + "]";
-  if (t.st->active) line += " SCENE-DEPTH stage " + std::to_string(dd->calibGroup.load());
+  if (t.st->active) line += " SCENE-DEPTH stage " + std::to_string(t.st->stage);
   Log(1, "%s", line.c_str());
 }
 void TraceEnd(TlsCb& t) {
@@ -1573,8 +1577,41 @@ void CalibBeforePass(TlsCb& t, VkCommandBuffer cb, const VkRenderingInfo* ri) {
   int want;
   const uint64_t main = dd->mainClass.load();
   if (st.active && (main == 0 || main == DepthClass(st))) {
-    uint32_t g = dd->calibGroup.load();
-    if (st.clears && g < 3) dd->calibGroup = ++g;
+    // A new stage each time the scene depth is cleared (another camera), or when the scene goes on in
+    // another depth image. A pass that goes back to an image of an earlier stage without clearing it
+    // continues that stage (EDF 6: the main scene, a far-away layer in another image with its own
+    // projection, then more of the main scene): its samples and its depth belong to that camera.
+    uint32_t g;
+    {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      g = dd->calibGroup.load();
+      // The first stage's image cleared again after the frame went on to later stages and came back:
+      // the next frame begins (seen in the game's recording order; the present is recorded on
+      // another thread and can come late, in the middle of the next frame's stages)
+      if (st.clears && g > dd->curStage && dd->stageImg[1] == st.img) {
+        dd->calibGroup = g = 0;
+        for (auto& im : dd->stageImg) im = VK_NULL_HANDLE;
+        dd->stageFrameAt = dd->frame;
+      }
+      if (!dd->stageImg[g]) dd->stageImg[g] = st.img;
+      if (st.clears || dd->stageImg[g] != st.img) {
+        int back = -1;
+        if (!st.clears)
+          for (int s = int(g); s >= 0; --s)
+            if (dd->stageImg[s] == st.img) { back = s; break; }
+        if (back >= 0) {
+          g = uint32_t(back);
+        } else if (g < 3) {
+          dd->calibGroup = ++g;
+          dd->stageImg[g] = st.img;
+        }
+      }
+    }
+    st.stage = g;
+    {
+      std::lock_guard<std::mutex> l(dd->depthLock);
+      dd->curStage = g;
+    }
     want = int(1 + g);
   } else if (ri->pDepthAttachment && ri->pDepthAttachment->imageView) {
     want = 0;
@@ -4508,7 +4545,12 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
     Log(1, "  HUD separation, last frame: %u samples, equal to copy 0/1/2: %u %u %u, copy equal to an earlier "
            "frame: %u %u %u", st[11], st[8], st[9], st[10], st[12], st[13], st[14]);
   }
-  dd->calibGroup = 0;  // the next frame's scene stages count from 0
+  const uint64_t sfa = dd->stageFrameAt.load();
+  if (sfa == UINT64_MAX || frame > sfa + 10) {  // (unless the passes tell where frames begin)
+    dd->calibGroup = 0;  // the next frame's scene stages count from 0
+    std::lock_guard<std::mutex> l(dd->depthLock);
+    for (auto& im : dd->stageImg) im = VK_NULL_HANDLE;
+  }
   const uint32_t copied = dd->copiedStages.exchange(0);
 
   dd->stage = "present(depth): waiting for previous copy";
@@ -4584,7 +4626,7 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
     pc.W = W;
     pc.H = H;
     // the stages copied in this frame that have a known projection: the shader combines them
-    uint32_t stages = copied, metaTail[11] = {};
+    uint32_t stages = copied, metaTail[12] = {};
     VkDeviceSize strideBytes;
     {
       std::lock_guard<std::mutex> l(dd->depthLock);
@@ -4654,6 +4696,7 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
       }
     }
     metaTail[10] = dd->depthFlip;
+    metaTail[11] = Cfg().depthNearest ? 1u : 0u;
     dd->d.CmdUpdateBuffer(cb, dd->metaBuf, 64, sizeof(metaTail), metaTail);
     bool on = stages != 0 && pc.depth && dd->depthCopies.load() > 0 && fresh;
     pc.a = 0.0f;

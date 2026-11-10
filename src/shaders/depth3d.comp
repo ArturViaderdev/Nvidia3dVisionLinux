@@ -19,6 +19,7 @@ layout(push_constant) uniform PC {
   U32s meta;    // stage s: [4s] Dw [4s+1] Dh [4s+2] format 0 f32, 1 unorm24, 2 unorm16;
                 // [16+s] A, [20+s] B of its projection (float bits); [24] stages of this frame; [25] stride;
                 // [26] 1 = the depth is upside down (Unity draws its scene upside down into textures)
+                // [27] 1 = the nearest stage wins (layers: a far-away layer drawn after the main scene)
   uint W, H;
   float a, b;   // b != 0: depth available this frame (the projections are in meta)
   float kL, kR; // per-eye shift at infinity (NDC); 0 = 2D
@@ -62,6 +63,8 @@ float DepthAt(uint stage, uint idx, uint fmt) {
 float InvWFlip(uint x, uint y, uint flip) {
   if (pc.b == 0.0) return 0.0;
   uint mask = pc.meta.v[24];
+  bool nearest = pc.meta.v[27] != 0u;
+  float best = 0.0;
   for (int s = 3; s >= 0; --s) {
     if ((mask & (1u << uint(s))) == 0u) continue;
     uint Dw = pc.meta.v[4 * s], Dh = pc.meta.v[4 * s + 1], fmt = pc.meta.v[4 * s + 2];
@@ -79,9 +82,12 @@ float InvWFlip(uint x, uint y, uint flip) {
     float z = DepthAt(uint(s), idx, fmt);
     if (z <= 0.0 || z >= 1.0) continue;  // cleared here (normal or reversed depth): an earlier stage
     float iw = (z - uintBitsToFloat(pc.meta.v[16 + s])) / uintBitsToFloat(pc.meta.v[20 + s]);
-    if (iw > 0.0) return min(iw, 1.0e30);
+    if (iw > 0.0) {
+      if (!nearest) return min(iw, 1.0e30);
+      best = max(best, min(iw, 1.0e30));
+    }
   }
-  return 0.0;
+  return best;
 }
 float InvWAt(uint x, uint y) { return InvWFlip(x, y, pc.meta.v[26]); }
 
@@ -147,28 +153,32 @@ uint SrcAt(uint i) { return gSlot >= 0 ? SnapAt(i) : pc.color.v[i]; }
 float Luma(uint c) { vec4 v = unpackUnorm4x8(c); return dot(v.rgb, vec3(0.3, 0.59, 0.11)); }
 
 #if PASS == 1
-// A HUD pixel: f = what the game shows, s = the scene there before the HUD, r = the scene this eye
-// sees there (rebuilt). Translucent panels (a darkening or a whitening over the scene) let the scene
-// through: keep the panel but show this eye's scene through it, as f = s*t (+ white*(1-t)); opaque
-// HUD (any other colour change) stays as it is. (Taking f as it is would show the scene behind the
-// panels at the screen depth: rectangles of scene that do not move with it.)
-uint HudOver(uint f, uint s, uint r) {
-  vec3 F = unpackUnorm4x8(f).rgb, S = unpackUnorm4x8(s).rgb, R = unpackUnorm4x8(r).rgb;
+// A HUD pixel at (x, y): F = what the game shows, S = the scene there before the HUD. Translucent
+// panels (a darkening or a whitening over the scene) let the scene through: F = S * k (+ white * (1 - k));
+// opaque HUD (any other colour change) does not. -> true for a translucent panel, with its k and C.
+bool HudFit(uint x, uint y, out float kk, out vec3 C) {
+  uint i0 = y * pc.W + x;
+  vec3 F = unpackUnorm4x8(pc.color.v[i0]).rgb, S = unpackUnorm4x8(SnapAt(i0)).rgb;
   float lf = dot(F, vec3(0.3, 0.59, 0.11)), ls = dot(S, vec3(0.3, 0.59, 0.11));
-  float t;
-  vec3 model;
   if (lf <= ls) {
-    t = lf / max(ls, 1.0e-4);
-    model = S * t;
+    kk = lf / max(ls, 1.0e-4);
+    C = vec3(0.0);
   } else {
-    t = 1.0 - (lf - ls) / max(1.0 - ls, 1.0e-4);
-    model = vec3(1.0) - (vec3(1.0) - S) * t;
+    kk = 1.0 - (lf - ls) / max(1.0 - ls, 1.0e-4);
+    C = vec3(1.0 - kk);
   }
-  t = clamp(t, 0.0, 1.0);
-  vec3 err = abs(F - model);
-  if (max(max(err.r, err.g), err.b) > 0.12) return f;  // another colour: opaque HUD (a slight tint is a panel)
-  vec3 o = clamp(F + (R - S) * t, 0.0, 1.0);
-  return packUnorm4x8(vec4(o, 1.0));
+  kk = clamp(kk, 0.0, 1.0);
+  vec3 err = abs(F - (S * kk + C));
+  return max(max(err.r, err.g), err.b) <= 0.12;  // (a slight tint is a panel; another colour: opaque HUD)
+}
+// the panel kept, with this eye's scene R seen through it (F + (R - S) * k: the panel's own tint stays)
+uint HudOver(uint x, uint y, uint r) {
+  float kk;
+  vec3 C;
+  uint i0 = y * pc.W + x;
+  if (!HudFit(x, y, kk, C)) return pc.color.v[i0];
+  vec3 F = unpackUnorm4x8(pc.color.v[i0]).rgb, S = unpackUnorm4x8(SnapAt(i0)).rgb, R = unpackUnorm4x8(r).rgb;
+  return packUnorm4x8(vec4(clamp(F + (R - S) * kk, 0.0, 1.0), 1.0));
 }
 #endif
 
@@ -271,7 +281,11 @@ void main() {
     uint sx = x;
     if (key == 0u && (pc.hyb & 1u) != 0u) {
       // hybrid: the uncovered background was really seen by this eye one frame ago
-      pc.outc.v[row + x] = hud ? pc.color.v[y * pc.W + x] : pc.prev.v[row + x];
+      // (under a translucent HUD panel too: that image has the panel in the same place; under opaque
+      // HUD the HUD of this frame)
+      float kk;
+      vec3 C;
+      pc.outc.v[row + x] = hud && !HudFit(x, y, kk, C) ? pc.color.v[y * pc.W + x] : pc.prev.v[row + x];
       continue;
     }
     if (key == 0u) {
@@ -299,7 +313,7 @@ void main() {
     }
     uint c = SrcAt(y * pc.W + sx);
     if (hud) {  // HUD: on the screen plane, in both eyes
-      pc.outc.v[row + x] = HudOver(pc.color.v[y * pc.W + x], SnapAt(y * pc.W + x), c);
+      pc.outc.v[row + x] = HudOver(x, y, c);
       continue;
     }
     if (gSlot < 0 && (pc.hyb & 1u) != 0u && e != realE && sx != x) {

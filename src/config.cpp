@@ -109,6 +109,7 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "dump_shaders") && ParseBool(val, b)) g_cfg.dumpShaders = b;
   else if (!strcmp(key, "hud_separation") && ParseBool(val, b)) g_cfg.hudSeparation = b;
   else if (!strcmp(key, "flat_menus") && ParseBool(val, b)) g_cfg.flatMenus = b;
+  else if (!strcmp(key, "depth_layers")) g_cfg.depthNearest = !strcasecmp(val, "nearest");
   else if (!strcmp(key, "hud_split")) {
     if (!strcasecmp(val, "auto")) g_cfg.hudSplit = 0;
     else if (ParseFloat(val, f)) g_cfg.hudSplit = std::clamp(int(f), 0, 16);
@@ -188,7 +189,7 @@ static void LoadEnv() {
                                 "hide_extensions", "patch_shaders", "log_level", "hotkeys", "emitter",
                                 "emitter_delay_us", "emitter_invert", "emitter_button", "refresh",
                                 "present_images", "test_pattern", "input", "skip_repeats", "shift_shadows", "hide_mesh_shaders", "record_width",
-                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation", "hud_split", "flat_menus"};
+                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation", "hud_split", "flat_menus", "depth_layers"};
   for (const char* k : kKeys) {
     std::string env = "NV3D_";
     for (const char* c = k; *c; ++c) env += char(toupper(*c));
@@ -276,6 +277,7 @@ void SaveConfig() {
   if (g_cfg.hudSplit > 0) fprintf(f, "hud_split = %d\n", g_cfg.hudSplit);
   else fprintf(f, "hud_split = auto\n");
   fprintf(f, "flat_menus = %d\n", g_cfg.flatMenus ? 1 : 0);
+  fprintf(f, "depth_layers = %s\n", g_cfg.depthNearest ? "nearest" : "latest");
   fclose(f);
   struct stat st;
   if (stat(g_profile.c_str(), &st) == 0) g_profileMtime = st.st_mtime;
