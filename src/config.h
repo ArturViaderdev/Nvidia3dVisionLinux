@@ -45,7 +45,9 @@ struct Config {
   bool hudSeparation = false;  // depth/hybrid: rebuild the eyes from a copy of the scene taken before the HUD (experimental)
   int hudSplit = 0;
   bool flatMenus = false;
-  bool depthNearest = false;   // depth / hybrid: where several scene stages have depth, the nearest wins (else the latest)      // hybrid: screens without a 3D scene (menus) without stereo shift            // the copy is taken after this draw into the back buffer (0 = automatic)
+  bool depthNearest = false;
+  bool stream = true;          // live streaming through gamestreamd (gamecapture): connect when it runs
+  bool streamFull = false;     // live streaming: full SBS (each eye at the stream size) instead of half SBS   // depth / hybrid: where several scene stages have depth, the nearest wins (else the latest)      // hybrid: screens without a 3D scene (menus) without stereo shift            // the copy is taken after this draw into the back buffer (0 = automatic)
   bool dumpShaders = false;    // save every shader (SPIR-V) the game creates to ~/.cache/3dvision/shaders/<game>
   int fixShadows = 2;          // screen-space position rebuilds corrected (Unreal shadows): 0 off, 1 on, 2 auto
   bool fixShadowsOn = true;    // runtime switch (Ctrl+Shift+Pause) to compare with / without
@@ -70,6 +72,7 @@ bool PollControls();
 bool TakeDumpRequest(uint64_t frame);
 // Ctrl+Shift+F12: start / stop recording. Returns true once per key press.
 bool TakeRecordToggle();
+bool TakeStreamToggle();  // Ctrl+Shift+B: start / stop the live stream (any thread)
 std::string DumpDir();
 
 }  // namespace stereo3d

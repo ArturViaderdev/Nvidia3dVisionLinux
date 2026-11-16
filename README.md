@@ -106,6 +106,7 @@ Either way the display always gets left, right, left, right… at the monitor's 
 | F12 | start / stop recording a 3D video (full SBS) |
 | Pause | Unreal shadow corrections on/off (`fix_shadows`) |
 | Scroll Lock | depth / hybrid: HUD separation off → automatic → copy after draw 1 ... 6 (`hud_separation`, `hud_split`) |
+| B | start / stop the live stream (gamestreamd: Twitch / YouTube) |
 | Insert / Delete | shutter delay +25 / −25 µs |
 | End | shutter invert |
 | PgUp / PgDn / Home | zoom in / out / reset |
@@ -120,6 +121,16 @@ Emitter: wheel = separation, wheel with button pressed = convergence, button = 3
 - Encoded on the graphics card with **NVENC (HEVC)**: small impact on the game. The layer scales both eyes into one image on the GPU and reads it back; a separate thread hands it to ffmpeg. Without NVENC it falls back to libx264 on the CPU (slower).
 - Files: `~/Videos/3dvision/<Game>-<date>-sbs.mkv` (or `~/Vídeos/...`), constant 60 fps, tagged as side-by-side. Change it with `record_dir`, the size of each eye with `record_width` / `record_height` (default 1920x1080 → 3840x1080 video, `0` = display size), `record_fps`, and `record = 1` to record from the start (`default.conf.example`).
 - The log tells when it starts/stops, frames written and dropped; the recorder's own log is `~/.cache/3dvision/recorder.log`.
+
+## Live streaming (Twitch / YouTube)
+
+The 3D picture can be streamed live to **Twitch, YouTube or both at once** with **gamestreamd**, the daemon of the gamecapture project (`gamecapture` folder): it already does the encoding (NVENC), the audio (game + microphone), the stream keys and one connection per destination. The layer sends it the stereo picture **side by side**, so viewers watch it flat or in 3D with any SBS player or headset.
+
+- Default: **half SBS 1920x1080 at 60 fps** (each eye squeezed to 960x1080, the usual YouTube/TV 3D format). The size and fps are gamestreamd's (`resolution`, `fps` in `~/.config/gamestream/gamestream.conf`); `stream_sbs = full` in the layer's configuration makes each eye that size instead (3840x1080).
+- Start gamestreamd (`systemctl --user enable --now gamestreamd`), set your keys in `gamestream.conf` (`service = ambos` for both), and launch the game as usual with the 3D layer (not with gamecapture's `gamestream` wrapper: its own capture would see the alternating eyes, and its hotkey Ctrl+Shift+F9 is the 3D profile save).
+- **Ctrl+Shift+B** in the game starts and stops the stream; `gamestreamd toggle` / `gamestreamd status` from the desktop too. The log says `live streaming: ...` (connected, start, size, pairs sent and skipped).
+- Zero-copy like gamecapture: both eyes are blitted side by side into exportable VRAM on the GPU, right after each pair, and gamestreamd imports that memory in CUDA for NVENC. The game never waits: if the encoder is behind, pairs are skipped. Works in every mode (alternate, replay, depth, hybrid) and with 3D video playback.
+- gamestreamd's camera (`camera = yes`) appears in both eyes: the layer tells the daemon the picture is side by side, so it puts the camera in the same corner of each eye, at screen depth and with the right proportions (needs the gamestreamd built from the current gamecapture; an older one puts it in one eye only). `stream = 0` turns the connection off.
 
 ## Configuration
 
@@ -172,6 +183,7 @@ src/layer.cpp          Vulkan layer: virtual swapchain, replay/alternate, stereo
 src/emitter.cpp        3D Vision emitter (usbfs), firmware, vblank PLL and sync thread
 src/spirv_patch.cpp    SPIR-V patcher (stereo shift)
 src/spirv_screenfix.cpp  screen-space position rebuild correction (fix_shadows)
+src/stream.inc         live streaming through gamestreamd (gamecapture); src/gamestream_protocol.h its protocol
 src/config.cpp         configuration, profiles, logs, hotkeys
 src/output.cpp         optional own output window (X11)
 tools/3dvision-tool    firmware extraction, status, glasses test, shader-fix
@@ -294,6 +306,7 @@ En los dos casos la pantalla recibe siempre izquierdo, derecho, izquierdo, derec
 | F12 | empezar / parar la grabación de un vídeo 3D (SBS completo) |
 | Pausa | correcciones de sombras de Unreal sí/no (`fix_shadows`) |
 | Bloq Despl | depth / hybrid: separación del HUD desactivada → automática → copia tras el dibujo 1 ... 6 (`hud_separation`, `hud_split`) |
+| B | empezar / parar la emisión en directo (gamestreamd: Twitch / YouTube) |
 | Insert / Supr | retardo del obturador +25 / −25 µs |
 | Fin | invertir obturador |
 | RePág / AvPág / Inicio | zoom más / menos / restablecer |
@@ -308,6 +321,16 @@ Emisor: rueda = separación, rueda con el botón pulsado = convergencia, botón 
 - Se codifica en la gráfica con **NVENC (HEVC)**: apenas afecta al juego. La capa junta los dos ojos en una imagen en la GPU y la lee; un hilo aparte se la pasa a ffmpeg. Sin NVENC usa libx264 en la CPU (más lento).
 - Archivos: `~/Vídeos/3dvision/<Juego>-<fecha>-sbs.mkv` (o `~/Videos/...`), 60 fps constantes, marcados como lado a lado. Se cambia con `record_dir`; el tamaño de cada ojo con `record_width` / `record_height` (por defecto 1920x1080 → vídeo 3840x1080, `0` = tamaño del monitor), `record_fps`, y `record = 1` para grabar desde el inicio (`default.conf.example`).
 - El registro dice cuándo empieza/para, fotogramas escritos y perdidos; el registro del grabador es `~/.cache/3dvision/recorder.log`.
+
+## Emisión en directo (Twitch / YouTube)
+
+La imagen 3D se puede emitir en directo a **Twitch, YouTube o los dos a la vez** con **gamestreamd**, el daemon del proyecto gamecapture (carpeta `gamecapture`): ya se encarga de codificar (NVENC), del audio (juego + micrófono), de las claves y de una conexión por destino. La capa le manda la imagen estéreo **lado a lado**, así que se puede ver en plano o en 3D con cualquier reproductor o visor SBS.
+
+- Por defecto: **half SBS 1920x1080 a 60 fps** (cada ojo comprimido a 960x1080, el formato 3D habitual en YouTube y teles). El tamaño y los fps son los de gamestreamd (`resolution`, `fps` en `~/.config/gamestream/gamestream.conf`); con `stream_sbs = full` en la configuración de la capa cada ojo tiene ese tamaño (3840x1080).
+- Arranca gamestreamd (`systemctl --user enable --now gamestreamd`), pon tus claves en `gamestream.conf` (`service = ambos` para los dos) y lanza el juego como siempre con la capa 3D (no con el lanzador `gamestream` de gamecapture: su captura vería los ojos alternos, y su atajo Ctrl+Shift+F9 es el de guardar el perfil 3D).
+- **Ctrl+Shift+B** en el juego empieza y para la emisión; también `gamestreamd toggle` / `gamestreamd status` desde el escritorio. El registro dice `live streaming: ...` (conectado, inicio, tamaño, pares enviados y saltados).
+- Sin copias por la CPU, como en gamecapture: los dos ojos se copian lado a lado en VRAM exportable en la GPU, justo después de cada par, y gamestreamd importa esa memoria en CUDA para NVENC. El juego nunca espera: si el codificador va atrasado se saltan pares. Funciona en todos los modos (alternate, replay, depth, hybrid) y al reproducir vídeo 3D.
+- La cámara de gamestreamd (`camera = yes`) sale en los dos ojos: la capa le dice al daemon que la imagen es lado a lado, y la pone en la misma esquina de cada ojo, a la profundidad de la pantalla y con su proporción correcta (hace falta el gamestreamd compilado del gamecapture actual; uno anterior la pone en un solo ojo). `stream = 0` desactiva la conexión.
 
 ## Configuración
 

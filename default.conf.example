@@ -121,6 +121,12 @@ flat_menus = 0
 # o la mas cercana (nearest: capas lejanas dibujadas despues de la escena principal, EDF 6)
 depth_layers = latest
 
+# Emision en directo (Twitch / YouTube) con gamestreamd (proyecto gamecapture): Ctrl+Shift+B empieza / para.
+# stream = 1 se conecta a gamestreamd si esta en marcha (0 = nada). stream_sbs = half (por defecto: el tamano
+# de gamestream.conf es la imagen entera, 1920x1080 = cada ojo 960x1080) o full (cada ojo de ese tamano)
+stream = 1
+stream_sbs = half
+
 # Guardar todos los shaders del juego (SPIR-V) en ~/.cache/3dvision/shaders/<juego> para
 # analizarlos (3dvision-tool shader-fix, 3dvision-shader-scan). Solo para diagnostico.
 dump_shaders = 0

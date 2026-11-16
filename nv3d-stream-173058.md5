@@ -1,0 +1,7 @@
+277bfec944b4746f7644b7c5a051bc83  src/layer.cpp
+3ba7c58fca39b4cf541d38b09e40d9be  src/stream.inc
+72bab4e95490b008b068483a2a1eddef  src/gamestream_protocol.h
+f24f7a1201a3531f4b7bf6f86f2337b7  src/config.cpp
+ce756a5a0995557f5c6f670e371f03ff  src/config.h
+a81b1373e73d101630875dfd590af04f  README.md
+33a96ec44712729acab127ad78c10e60  default.conf.example

@@ -29,6 +29,11 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <cstddef>
+#include <deque>
 #include <cstdio>
 #include <atomic>
 #include <chrono>
@@ -48,6 +53,7 @@
 #include "output.h"
 #include "spirv_patch.h"
 #include "depth3d_spv.h"
+#include "gamestream_protocol.h"  // live streaming through gamestreamd (stream.inc)
 
 #define LAYER_NAME "VK_LAYER_3DVISION_linux"
 #define EXPORT extern "C" __attribute__((visibility("default")))
@@ -236,6 +242,11 @@ struct DeviceData {
   int32_t presQueueIndex = -1;          // index in gfxFamily (-1: shared with the game)
   bool presentWait = false;             // VK_KHR_present_id + VK_KHR_present_wait enabled by us
   bool recordResume = false;            // a recording was running on a destroyed swapchain
+  // live streaming through gamestreamd (stream.inc): exportable memory (VK_KHR_external_memory_fd)
+  struct Streamer* stream = nullptr;
+  bool streamOk = false, streamDedicated = false, streamHasUuid = false;
+  uint8_t streamUuid[16] = {};
+  PFN_vkGetMemoryFdKHR getMemoryFd = nullptr;
 
   OutputWindow* out = nullptr;     // own window on the glasses monitor
   VkSurfaceKHR outSurface = VK_NULL_HANDLE;
@@ -2048,6 +2059,33 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice phys, const Vk
   }
   bool wantSwapchain = false;
   for (const char* e : exts) wantSwapchain |= !strcmp(e, "VK_KHR_swapchain");
+  // live streaming: the stereo pairs go to gamestreamd in exportable VRAM buffers
+  bool streamExt = false, streamDedicated = false;
+  if (wantSwapchain && Cfg().stream && !Cfg().passthrough && api >= VK_API_VERSION_1_1) {
+    auto gebp = (PFN_vkGetPhysicalDeviceExternalBufferProperties)inst->gipa(
+        inst->instance, "vkGetPhysicalDeviceExternalBufferProperties");
+    uint32_t n = 0;
+    inst->d.EnumerateDeviceExtensionProperties(phys, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> av(n);
+    inst->d.EnumerateDeviceExtensionProperties(phys, nullptr, &n, av.data());
+    bool has = false;
+    for (auto& e : av) has |= !strcmp(e.extensionName, "VK_KHR_external_memory_fd");
+    if (has && gebp) {
+      VkPhysicalDeviceExternalBufferInfo ebi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+      ebi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      ebi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      VkExternalBufferProperties ebp{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+      gebp(phys, &ebi, &ebp);
+      const auto f = ebp.externalMemoryProperties.externalMemoryFeatures;
+      streamExt = (f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0;
+      streamDedicated = (f & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0;
+    }
+    if (streamExt) {
+      bool have = false;
+      for (const char* e : exts) have |= !strcmp(e, "VK_KHR_external_memory_fd");
+      if (!have) exts.push_back("VK_KHR_external_memory_fd");
+    }
+  }
   VkPhysicalDevicePresentIdFeaturesKHR pidF{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
   VkPhysicalDevicePresentWaitFeaturesKHR pwF{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
   bool presentWait = false;
@@ -2129,6 +2167,19 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice phys, const Vk
   DEV_FUNCS(LOAD)
 #undef LOAD
   inst->d.GetPhysicalDeviceMemoryProperties(phys, &dd->memProps);
+  if (streamExt) {
+    dd->getMemoryFd = (PFN_vkGetMemoryFdKHR)gdpa(*pDevice, "vkGetMemoryFdKHR");
+    dd->streamOk = dd->getMemoryFd != nullptr;
+    dd->streamDedicated = streamDedicated;
+    auto gpp2 = (PFN_vkGetPhysicalDeviceProperties2)inst->gipa(inst->instance, "vkGetPhysicalDeviceProperties2");
+    if (gpp2) {
+      VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+      VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp};
+      gpp2(phys, &p2);
+      memcpy(dd->streamUuid, idp.deviceUUID, 16);
+      dd->streamHasUuid = true;
+    }
+  }
 
   dd->gfxFamily = gfxFam;
   dd->presentWait = presentWait && dd->d.WaitForPresentKHR;
@@ -2187,11 +2238,14 @@ struct Swapchain;
 void StopPresenter(DeviceData* dd, Swapchain* sc);
 struct Recorder;
 void DestroyRecorder(Recorder* r);
+void StartStreamer(DeviceData* dd);  // live streaming (stream.inc)
+void StopStreamer(DeviceData* dd);
 Recorder* CreateRecorder(DeviceData* dd, Swapchain* sc);
 
 VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* a) {
   DeviceData* dd = Dev(device);
   if (!dd) return;
+  StopStreamer(dd);
   dd->stopWatchdog = true;
   if (dd->watchdog.joinable()) dd->watchdog.join();
   {  // swapchains the app did not destroy: stop their presenter threads
@@ -3497,6 +3551,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_CreateSwapchainKHR(VkDevice device, const Vk
   DeviceData* dd = Dev(device);
   InstanceData* inst = dd->inst;
   if (Cfg().passthrough) return dd->d.CreateSwapchainKHR(device, ci, a, pSwapchain);
+  StartStreamer(dd);  // (once per device: connects to gamestreamd when it runs)
   // the old swapchain's presenter must stop using it before it is retired
   if (ci->oldSwapchain)
     if (Swapchain* old = FindSwapchain(dd, ci->oldSwapchain)) StopPresenter(dd, old);
@@ -4283,6 +4338,8 @@ void ToggleRecording(DeviceData* dd, Swapchain* sc) {
 }
 
 // After the game's submits for a pair, on the same queue: pair -> SBS image -> host buffer
+#include "stream.inc"
+
 void CapturePair(DeviceData* dd, Swapchain* sc, VkQueue q, int slot) {
   Recorder* r = sc->rec;
   if (!r || r->failed.load()) return;
@@ -4458,6 +4515,7 @@ VkResult PresentAlternate(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t
     SignalWritten(dd, subQueue, sc, slot);
     Publish(sc, slot);
     CapturePair(dd, sc, subQueue, slot);
+    StreamPair(dd, sc, subQueue, slot);
   }
   FinishCapture(dd, sc, cap, vi.fence, frame);
   if (detect) {
@@ -4814,6 +4872,7 @@ VkResult PresentDepth(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t idx
   SignalWritten(dd, subQueue, sc, slot);
   Publish(sc, slot);
   CapturePair(dd, sc, subQueue, slot);
+  StreamPair(dd, sc, subQueue, slot);
   FinishCapture(dd, sc, cap, vi.fence, frame);
   dd->frame = frame + 1;
   LogStats(dd, sc, false);
@@ -4922,6 +4981,7 @@ VkResult PresentReplay(DeviceData* dd, VkQueue queue, Swapchain* sc, uint32_t id
   }
   Publish(sc, slot);
   CapturePair(dd, sc, queue, slot);
+  StreamPair(dd, sc, queue, slot);
   if (doReplay) ++dd->replayFrames;
   FinishCapture(dd, sc, cap, vi.fence, dd->frame);
   if (detect) {

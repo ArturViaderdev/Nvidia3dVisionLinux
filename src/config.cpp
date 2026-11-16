@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -110,6 +111,8 @@ static void ApplyKey(const char* key, const char* val) {
   else if (!strcmp(key, "hud_separation") && ParseBool(val, b)) g_cfg.hudSeparation = b;
   else if (!strcmp(key, "flat_menus") && ParseBool(val, b)) g_cfg.flatMenus = b;
   else if (!strcmp(key, "depth_layers")) g_cfg.depthNearest = !strcasecmp(val, "nearest");
+  else if (!strcmp(key, "stream") && ParseBool(val, b)) g_cfg.stream = b;
+  else if (!strcmp(key, "stream_sbs")) g_cfg.streamFull = !strcasecmp(val, "full");
   else if (!strcmp(key, "hud_split")) {
     if (!strcasecmp(val, "auto")) g_cfg.hudSplit = 0;
     else if (ParseFloat(val, f)) g_cfg.hudSplit = std::clamp(int(f), 0, 16);
@@ -189,7 +192,7 @@ static void LoadEnv() {
                                 "hide_extensions", "patch_shaders", "log_level", "hotkeys", "emitter",
                                 "emitter_delay_us", "emitter_invert", "emitter_button", "refresh",
                                 "present_images", "test_pattern", "input", "skip_repeats", "shift_shadows", "hide_mesh_shaders", "record_width",
-                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation", "hud_split", "flat_menus", "depth_layers"};
+                                "record_height", "record_fps", "record", "replay_warmup", "dump_shaders", "fix_shadows", "hud_separation", "hud_split", "flat_menus", "depth_layers", "stream", "stream_sbs"};
   for (const char* k : kKeys) {
     std::string env = "NV3D_";
     for (const char* c = k; *c; ++c) env += char(toupper(*c));
@@ -299,11 +302,11 @@ struct X11 {
 X11 g_x;
 
 enum Key { kCtrlL, kCtrlR, kShiftL, kShiftR, kF3, kF4, kF5, kF6, kF7, kF8, kF9, kF10, kF11,
-           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kF12, kPause, kScroll, kCount };
+           kPgUp, kPgDn, kHome, kF1, kF2, kIns, kDel, kEnd, kF12, kPause, kScroll, kB, kCount };
 static_assert(kCount <= 32, "X11::kc holds 32 keys");
 const unsigned long kSyms[kCount] = {0xFFE3, 0xFFE4, 0xFFE1, 0xFFE2, 0xFFC0, 0xFFC1, 0xFFC2, 0xFFC3,
                                      0xFFC4, 0xFFC5, 0xFFC6, 0xFFC7, 0xFFC8, 0xFF55, 0xFF56, 0xFF50,
-                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57, 0xFFC9, 0xFF13, 0xFF14};
+                                     0xFFBE, 0xFFBF, 0xFF63, 0xFFFF, 0xFF57, 0xFFC9, 0xFF13, 0xFF14, 0x0062};
 bool g_dumpRequested = false;
 bool g_recordToggle = false;
 
@@ -322,7 +325,7 @@ bool InitX11() {
   g_x.ok = true;
   Log(1, "hotkeys: Ctrl+Shift + F3/F4 sep -/+  F5/F6 conv -/+  F7 swap eyes  F8 3D on/off  F9 save  F10 test pattern  "
          "F11 capture  F12 record video  Ins/Del shutter delay +/-  End shutter invert  PgUp/PgDn zoom  Home zoom=1  F1/F2 HUD depth  Pause shadow fix on/off  "
-         "Scroll Lock HUD separation (off / auto / split 1-6)");
+         "Scroll Lock HUD separation (off / auto / split 1-6)  B live stream (gamestreamd)");
   return true;
 }
 
@@ -348,6 +351,9 @@ bool TakeDumpRequest(uint64_t frame) {
   }
   return false;
 }
+
+std::atomic<bool> g_streamToggle{false};
+bool TakeStreamToggle() { return g_streamToggle.exchange(false); }
 
 bool TakeRecordToggle() {
   static bool first = true;
@@ -423,6 +429,10 @@ bool PollControls() {
     g_cfg.fixShadowsOn = !g_cfg.fixShadowsOn;
     changed = true;
     Log(1, "fix_shadows corrections %s", g_cfg.fixShadowsOn ? "ON" : "OFF");
+  }
+  if (pressed(kB)) {
+    g_streamToggle = true;
+    Log(1, "live stream: start / stop requested");
   }
   if (pressed(kScroll)) {  // HUD separation: off -> automatic -> after draw 1, 2 ... 6 -> off
     if (!g_cfg.hudSeparation) g_cfg.hudSeparation = true, g_cfg.hudSplit = 0;
