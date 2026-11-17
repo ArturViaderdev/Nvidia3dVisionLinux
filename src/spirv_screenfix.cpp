@@ -19,6 +19,21 @@
 // (texture-derived, nothing from the screen)  is a candidate; it is patched only if, further on,
 // it is multiplied by a uniform-only value AND summed with the same kind of term for y: that is
 // a matrix applied to (x*W, y*W, ...), the signature of the position rebuild.
+//
+// Second form, in the scene's own material shaders (Unreal's base pass and forward materials):
+//
+//     TranslatedWorld = mul(float4(SvPosition.xyz, 1), SVPositionToTranslatedWorld)   (then / .w)
+//
+// with the raw FragCoord x, y and z. The pixel is k * (1 - conv / W) * ViewportWidth / 2 pixels off
+// (W = 1 / FragCoord.w, the depth of the surface being shaded), so the world position lands beside
+// the surface: Unreal samples its volumetric lightmap (sky / indirect light) there, and inside an
+// object that light is black. Here FragCoord.x is replaced, only in that matrix product, by
+//
+//     FragCoord.x - k * f * (1 - conv * FragCoord.w) * params[5] / 2      (params[5] = viewport width)
+//
+// Found the same way: (raw FragCoord.x * uniform) summed with (FragCoord.y * uniform) and
+// (FragCoord.z * uniform). Passes that read the depth from a texture are not touched (FragCoord.w
+// would not be the depth of the pixel there).
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
@@ -31,7 +46,7 @@ namespace stereo3d {
 namespace {
 
 enum : uint32_t {
-  OpExtension = 10, OpExtInstImport = 11, OpExtInst = 12, OpMemoryModel = 14, OpEntryPoint = 15,
+  OpTypeVoid = 19, OpExtension = 10, OpExtInstImport = 11, OpExtInst = 12, OpMemoryModel = 14, OpEntryPoint = 15,
   OpCapability = 17, OpTypeBool = 20, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23,
   OpTypeMatrix = 24, OpTypeStruct = 30, OpTypePointer = 32, OpConstant = 43, OpFunction = 54,
   OpFunctionParameter = 55, OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62,
@@ -49,12 +64,18 @@ enum : uint32_t {
 };
 
 // taint bits
-enum : uint8_t { SX = 1, SY = 2, TX = 4, UN = 8, PX = 16, PY = 32, XM = 64, YM = 128 };
+typedef uint16_t Taint;
+enum : Taint {
+  SX = 1, SY = 2, TX = 4, UN = 8, PX = 16, PY = 32, XM = 64, YM = 128,
+  SZ = 256,                         // FragCoord.z
+  BX = 512, BY = 1024, BZ = 2048,   // FragCoord.x / y / z * uniform (SvPosition rebuild)
+};
+constexpr Taint kScreenMix = SX | SY | SZ | TX | PX | PY;
 
 struct Val {
   uint8_t n = 1;
-  uint8_t t[4] = {0, 0, 0, 0};
-  uint8_t All() const { return uint8_t(t[0] | t[1] | t[2] | t[3]); }
+  Taint t[4] = {0, 0, 0, 0};
+  Taint All() const { return Taint(t[0] | t[1] | t[2] | t[3]); }
 };
 
 struct TypeInfo {
@@ -73,12 +94,16 @@ struct Cand {
   uint32_t w;        // the W operand
   int wComp;         // component of W (-1: scalar)
   bool confirmed = false;
+  int kind = 0;      // 0: ScreenPos.x * SceneW (texture depth), 1: raw FragCoord.x * matrix (SvPosition)
+  uint32_t xid = 0;  // kind 1: the FragCoord.x operand
 };
 
-bool IsScreenX(uint8_t x) { return (x & SX) && !(x & (SY | TX | PX | PY)); }
-bool IsScreenY(uint8_t x) { return (x & SY) && !(x & (SX | TX | PX | PY)); }
-bool IsDepth(uint8_t x) { return (x & TX) && !(x & (SX | SY | PX | PY)); }
-bool PureU(uint8_t x) { return (x & UN) && !(x & (SX | SY | TX | PX | PY)); }
+bool Only(Taint x, Taint bit) { return (x & bit) && !(x & (kScreenMix & ~bit)); }
+bool IsScreenX(Taint x) { return Only(x, SX); }
+bool IsScreenY(Taint x) { return Only(x, SY); }
+bool IsScreenZ(Taint x) { return Only(x, SZ); }
+bool IsDepth(Taint x) { return Only(x, TX); }
+bool PureU(Taint x) { return (x & UN) && !(x & kScreenMix); }
 
 void Emit(std::vector<uint32_t>& o, uint32_t op, std::initializer_list<uint32_t> operands) {
   o.push_back(((uint32_t(operands.size()) + 1) << 16) | op);
@@ -180,7 +205,7 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
     if (it == val.end()) return r;
     const Val& v = it->second;
     if (v.n == cnt) return v;
-    uint8_t u = v.n == 1 ? v.t[0] : v.All();
+    Taint u = v.n == 1 ? v.t[0] : v.All();
     for (uint32_t c = 0; c < cnt; ++c) r.t[c] = u;
     return r;
   };
@@ -191,12 +216,28 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
       if (dst.size() < 32 && std::find(dst.begin(), dst.end(), c) == dst.end()) dst.push_back(c);
   };
   // product of two components; records candidates
-  auto product = [&](uint8_t a, uint8_t b, uint32_t ida, uint32_t idb, bool bIsVec, int comp, uint32_t rid,
-                     bool rvec, std::vector<uint32_t>& rprov) -> uint8_t {
-    uint8_t r = uint8_t(a | b);
+  // raw FragCoord.x values (scalar), and how to read FragCoord.w next to them
+  struct RawX { uint32_t vec = 0, ptrType = 0, var = 0; };
+  std::unordered_map<uint32_t, RawX> rawX;
+  std::unordered_map<uint32_t, uint32_t> fragVecs;  // whole FragCoord loads -> var
+  auto product = [&](Taint a, Taint b, uint32_t ida, uint32_t idb, bool bIsVec, int comp, uint32_t rid,
+                     bool rvec, std::vector<uint32_t>& rprov) -> Taint {
+    Taint r = Taint(a | b);
     for (int side = 0; side < 2; ++side) {
-      uint8_t x = side ? b : a, y = side ? a : b;
-      uint32_t idy = side ? ida : idb;
+      Taint x = side ? b : a, y = side ? a : b;
+      uint32_t idy = side ? ida : idb, idx = side ? idb : ida;
+      if (PureU(y)) {
+        if (IsScreenX(x) && rawX.count(idx)) {
+          r |= BX;
+          Cand c{rid, uint32_t(comp < 0 ? 0 : comp), rvec, 0, -1};
+          c.kind = 1;
+          c.xid = idx;
+          cands.push_back(c);
+          rprov.push_back(uint32_t(cands.size() - 1));
+        }
+        if (IsScreenY(x)) r |= BY;
+        if (IsScreenZ(x)) r |= BZ;
+      }
       bool yVec = side ? !bIsVec : bIsVec;  // (only used for the W operand)
       (void)yVec;
       if (IsScreenX(x) && IsDepth(y)) {
@@ -278,10 +319,18 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
         auto b = builtin.find(pi.var);
         if (sc == StorageInput && b != builtin.end() &&
             (b->second == BuiltInFragCoord || b->second == BuiltInGlobalInvocationId)) {
+          const bool frag = b->second == BuiltInFragCoord;
           for (uint32_t c = 0; c < cnt; ++c) {
             int src = pi.comp >= 0 ? pi.comp : int(c);
-            r.t[c] = src == 0 ? SX : src == 1 ? SY : 0;
+            r.t[c] = src == 0 ? SX : src == 1 ? SY : (src == 2 && frag) ? SZ : 0;
           }
+          if (frag && cnt == 1 && pi.comp == 0 && rt == idF32 && idType.count(w[3])) {
+            RawX rx;
+            rx.ptrType = idType[w[3]];
+            rx.var = pi.var;
+            rawX[rid] = rx;
+          }
+          if (frag && cnt == 4 && pi.comp < 0) fragVecs[rid] = pi.var;
         } else if (sc == StorageUniform || sc == StoragePushConstant || sc == StorageStorageBuffer ||
                    sc == StoragePhysicalStorageBuffer) {
           for (uint32_t c = 0; c < cnt; ++c) r.t[c] = UN;
@@ -292,7 +341,7 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
           } else if (m.n == cnt) {
             r = m;
           } else {
-            uint8_t u = m.All();
+            Taint u = m.All();
             for (uint32_t c = 0; c < cnt; ++c) r.t[c] = u;
           }
           auto mp = memProv.find(pi.var);
@@ -303,13 +352,18 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
       case OpCompositeExtract: {
         Val s = val.count(w[3]) ? val[w[3]] : Val();
         uint32_t idx = wc > 4 ? w[4] : 0;
-        uint8_t t = s.n > 1 && idx < s.n ? s.t[idx] : s.All();
+        Taint t = s.n > 1 && idx < s.n ? s.t[idx] : s.All();
         for (uint32_t c = 0; c < cnt; ++c) r.t[c] = t;
+        if (fragVecs.count(w[3]) && wc == 5 && idx == 0 && rt == idF32) {
+          RawX rx;
+          rx.vec = w[3];
+          rawX[rid] = rx;
+        }
         addProv(rprov, w[3]);
         break;
       }
       case OpCompositeConstruct: {
-        std::vector<uint8_t> all;
+        std::vector<Taint> all;
         for (uint32_t k = 3; k < wc; ++k) {
           Val s = val.count(w[k]) ? val[w[k]] : Val();
           for (uint32_t c = 0; c < s.n; ++c) all.push_back(s.t[c]);
@@ -362,9 +416,9 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
         uint32_t vecId = op == OpMatrixTimesVector ? w[4] : w[3], other = op == OpMatrixTimesVector ? w[3] : w[4];
         Val v = val.count(vecId) ? val[vecId] : Val(), m = val.count(other) ? val[other] : Val();
         if (op == OpDot && PureU(v.All()) && !PureU(m.All())) std::swap(v, m);
-        uint8_t mu = m.All(), acc = mu;
+        Taint mu = m.All(), acc = mu;
         for (uint32_t c = 0; c < v.n; ++c) {
-          uint8_t x = v.t[c];
+          Taint x = v.t[c];
           acc |= x;
           if (PureU(mu) && (x & PX)) acc |= XM;
           if (PureU(mu) && (x & PY)) acc |= YM;
@@ -378,7 +432,7 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
         if (op == OpExtInst && wc >= 5 && w[3] == glsl && w[4] == GlslFma && wc >= 8) {
           Val a = get(w[5], cnt), b = get(w[6], cnt), c3 = get(w[7], cnt);
           for (uint32_t c = 0; c < cnt; ++c)
-            r.t[c] = uint8_t(product(a.t[c], b.t[c], w[5], w[6], false, cnt > 1 ? int(c) : -1, rid, cnt > 1, rprov) |
+            r.t[c] = Taint(product(a.t[c], b.t[c], w[5], w[6], false, cnt > 1 ? int(c) : -1, rid, cnt > 1, rprov) |
                              c3.t[c]);
           for (uint32_t k = 5; k < 8; ++k) addProv(rprov, w[k]);
           break;
@@ -403,7 +457,15 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
     // a matrix applied to (x*W, y*W, ...): both terms meet here
     for (uint32_t c = 0; c < cnt; ++c)
       if ((r.t[c] & XM) && (r.t[c] & YM)) {
-        for (uint32_t k : rprov) cands[k].confirmed = true;
+        for (uint32_t k : rprov)
+          if (cands[k].kind == 0) cands[k].confirmed = true;
+        break;
+      }
+    // a matrix applied to the raw (FragCoord.x, y, z): the three terms meet here
+    for (uint32_t c = 0; c < cnt; ++c)
+      if ((r.t[c] & BX) && (r.t[c] & BY) && (r.t[c] & BZ)) {
+        for (uint32_t k : rprov)
+          if (cands[k].kind == 1) cands[k].confirmed = true;
         break;
       }
     val[rid] = r;
@@ -412,8 +474,15 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
 
   // ---- patch ---------------------------------------------------------------------------------
   std::unordered_map<uint32_t, std::vector<const Cand*>> sites;
+  std::unordered_map<uint32_t, uint32_t> bSites;   // product id -> the FragCoord.x operand to replace
+  std::unordered_map<uint32_t, uint32_t> fixedX;   // FragCoord.x id -> corrected id (filled below)
   for (const Cand& c : cands) {
     if (!c.confirmed) continue;
+    if (c.kind == 1) {
+      bSites[c.id] = c.xid;
+      fixedX[c.xid] = 0;
+      continue;
+    }
     auto rt = idType.find(c.id);
     if (rt == idType.end()) continue;
     const TypeInfo& t = types[rt->second];
@@ -428,7 +497,7 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
     for (const Cand* o : v) dup |= o->comp == c.comp;
     if (!dup) v.push_back(&c);
   }
-  if (sites.empty()) return PatchResult::NoPosition;
+  if (sites.empty() && bSites.empty()) return PatchResult::NoPosition;
 
   uint32_t bound = code[3];
   auto fresh = [&]() { return bound++; };
@@ -436,7 +505,14 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
   if (addU32) idU32 = fresh();
   if (addU64) idU64 = fresh();
   uint32_t idStruct = fresh(), idPtrStruct = fresh(), idPtrFloat = fresh(), idAddr = fresh(), idC0 = fresh(),
-           idC1 = fresh(), idC4 = fresh();
+           idC1 = fresh(), idC4 = fresh(), idC3 = 0, idC5 = 0, idOne = 0, idHalf = 0;
+  if (!bSites.empty()) {
+    idC3 = fresh();
+    idC5 = fresh();
+    idOne = fresh();
+    idHalf = fresh();
+    for (auto& fx : fixedX) fx.second = fresh();
+  }
 
   std::unordered_map<uint32_t, uint32_t> renamed;  // product id -> new id of the uncorrected product
   for (auto& st : sites) renamed[st.first] = fresh();
@@ -445,7 +521,7 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
   out.reserve(n + 64 + sites.size() * 40);
   out.insert(out.end(), code, code + 5);
   bool capsDone = false;
-  int patched = 0;
+  int patched = 0, patchedB = 0;
   for (size_t ii = 0; ii < insts.size(); ++ii) {
     const uint32_t* w = code + insts[ii].off;
     uint32_t op = insts[ii].op, wc = insts[ii].wc;
@@ -463,18 +539,24 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
     }
     if (ii == annotEnd) {
       Emit(out, OpDecorate, {idStruct, DecBlock});
-      for (uint32_t m = 0; m < 5; ++m) Emit(out, OpMemberDecorate, {idStruct, m, DecOffset, m * 4});
+      for (uint32_t m = 0; m < 6; ++m) Emit(out, OpMemberDecorate, {idStruct, m, DecOffset, m * 4});
     }
     if (ii == firstFunc) {
       if (addU32) Emit(out, OpTypeInt, {idU32, 32, 0});
       if (addU64) Emit(out, OpTypeInt, {idU64, 64, 0});
-      Emit(out, OpTypeStruct, {idStruct, idF32, idF32, idF32, idF32, idF32});
+      Emit(out, OpTypeStruct, {idStruct, idF32, idF32, idF32, idF32, idF32, idF32});
       Emit(out, OpTypePointer, {idPtrStruct, StoragePhysicalStorageBuffer, idStruct});
       Emit(out, OpTypePointer, {idPtrFloat, StoragePhysicalStorageBuffer, idF32});
       Emit(out, OpConstant, {idU64, idAddr, uint32_t(paramAddress & 0xFFFFFFFFu), uint32_t(paramAddress >> 32)});
       Emit(out, OpConstant, {idU32, idC0, 0});
       Emit(out, OpConstant, {idU32, idC1, 1});
       Emit(out, OpConstant, {idU32, idC4, 4});
+      if (idC3) {
+        Emit(out, OpConstant, {idU32, idC3, 3});
+        Emit(out, OpConstant, {idU32, idC5, 5});
+        Emit(out, OpConstant, {idF32, idOne, 0x3F800000u});
+        Emit(out, OpConstant, {idF32, idHalf, 0x3F000000u});
+      }
     }
     if (op == OpMemoryModel && w[1] == AddrLogical) {
       Emit(out, OpMemoryModel, {AddrPhysicalStorageBuffer64, w[2]});
@@ -486,6 +568,52 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
       out.insert(out.end(), w, w + wc);
       out[at + 1] = renamed[w[1]];
       continue;
+    }
+    if (ii >= firstFunc && wc >= 3 && types.count(w[1]) && !types.count(w[2])) {
+      // the SvPosition rebuild: its product reads the corrected FragCoord.x
+      auto b = bSites.find(w[2]);
+      if (b != bSites.end()) {
+        size_t at = out.size();
+        out.insert(out.end(), w, w + wc);
+        for (uint32_t k = (op == OpExtInst ? 5 : 3); k < wc; ++k)
+          if (out[at + k] == b->second) out[at + k] = fixedX[b->second];
+        ++patchedB;
+        continue;
+      }
+      // right after a raw FragCoord.x that such a product uses: its corrected value
+      auto fx = fixedX.find(w[2]);
+      if (fx != fixedX.end()) {
+        out.insert(out.end(), w, w + wc);
+        const RawX& rx = rawX[w[2]];
+        uint32_t fw = fresh();
+        if (rx.vec) {
+          Emit(out, OpCompositeExtract, {idF32, fw, rx.vec, 3});
+        } else {
+          uint32_t pw = fresh();
+          Emit(out, OpAccessChain, {rx.ptrType, pw, rx.var, idC3});
+          Emit(out, OpLoad, {idF32, fw, pw});
+        }
+        uint32_t ptr = fresh(), pk = fresh(), k = fresh(), pc = fresh(), cv = fresh(), pf = fresh(), f = fresh(),
+                 pv = fresh(), vw = fresh(), kf = fresh(), t = fresh(), om = fresh(), d = fresh(), e = fresh(),
+                 e2 = fresh();
+        Emit(out, OpConvertUToPtr, {idPtrStruct, ptr, idAddr});
+        Emit(out, OpAccessChain, {idPtrFloat, pk, ptr, idC0});
+        Emit(out, OpLoad, {idF32, k, pk, MemAligned, 4});
+        Emit(out, OpAccessChain, {idPtrFloat, pc, ptr, idC1});
+        Emit(out, OpLoad, {idF32, cv, pc, MemAligned, 4});
+        Emit(out, OpAccessChain, {idPtrFloat, pf, ptr, idC4});
+        Emit(out, OpLoad, {idF32, f, pf, MemAligned, 4});
+        Emit(out, OpAccessChain, {idPtrFloat, pv, ptr, idC5});
+        Emit(out, OpLoad, {idF32, vw, pv, MemAligned, 4});
+        Emit(out, OpFMul, {idF32, kf, k, f});
+        Emit(out, OpFMul, {idF32, t, cv, fw});         // conv / W
+        Emit(out, OpFSub, {idF32, om, idOne, t});      // 1 - conv / W: the shift in NDC / k
+        Emit(out, OpFMul, {idF32, d, kf, om});
+        Emit(out, OpFMul, {idF32, e, d, vw});
+        Emit(out, OpFMul, {idF32, e2, e, idHalf});     // in pixels
+        Emit(out, OpFSub, {idF32, fx->second, w[2], e2});
+        continue;
+      }
     }
     auto s = (ii >= firstFunc && wc >= 3) ? sites.find(w[2]) : sites.end();
     if (s == sites.end() || !types.count(w[1])) {
@@ -534,7 +662,10 @@ PatchResult PatchScreenSpace(const uint32_t* code, size_t n, uint64_t paramAddre
     ++patched;
   }
   out[3] = bound;
-  if (log) *log = "screen-space sites=" + std::to_string(patched);
+  if (log) {
+    *log = "screen-space sites=" + std::to_string(patched);
+    if (patchedB) *log += " SvPosition sites=" + std::to_string(patchedB);
+  }
   return PatchResult::Patched;
 }
 

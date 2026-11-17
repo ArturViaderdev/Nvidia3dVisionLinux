@@ -262,6 +262,9 @@ struct DeviceData {
   std::unordered_map<VkShaderModule, uint64_t> moduleHash;  // dump_shaders: module -> dumped file
   std::atomic<uint32_t> patchedCount{0}, skippedCount{0}, pipelineCount{0}, depthOnlyCount{0}, screenFixCount{0};
   bool screenFix = false;    // fix_shadows: correct the screen-space position rebuilds (fragment/compute)
+  // fix_shadows: viewport width of the scene's G-buffer passes (params[5]: the SvPosition correction
+  // turns the stereo shift into pixels with it)
+  std::atomic<float> sceneVpW{0.0f};
   bool unshiftD16 = false;   // fix_shadows: 16-bit depth-only pipelines (Unreal shadow maps) unshifted
   uint32_t lastFixLog[2] = {UINT32_MAX, UINT32_MAX};
 
@@ -878,6 +881,19 @@ inline TlsCb& CbState(VkCommandBuffer cb) {
     t_cb.dd = dd;
   }
   return t_cb;
+}
+
+// fix_shadows: the viewport width of the scene's G-buffer passes (4+ colour targets and a depth)
+thread_local bool t_scenePass = false;
+void NoteScenePass(DeviceData* dd, const VkRenderingInfo* ri) {
+  if (!dd || !dd->screenFix) return;
+  if (ri->flags & VK_RENDERING_RESUMING_BIT) return;
+  t_scenePass = ri->colorAttachmentCount >= 4 && ri->pDepthAttachment && ri->pDepthAttachment->imageView;
+  if (t_scenePass && ri->renderArea.extent.width) dd->sceneVpW = float(ri->renderArea.extent.width);
+}
+void NoteSceneViewport(DeviceData* dd, uint32_t n, const VkViewport* v) {
+  if (!dd || !dd->screenFix || !t_scenePass || !n || !v) return;
+  if (v[0].width > 0.0f) dd->sceneVpW = v[0].width;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL hook_CreateImage(VkDevice device, const VkImageCreateInfo* ci,
@@ -1666,6 +1682,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hook_EndCommandBuffer(VkCommandBuffer cb) {
 
 VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
   TlsCb& t = CbState(cb);
+  NoteScenePass(t.dd, ri);
   BeginRenderingCommon(t, ri);
   CalibBeforePass(t, cb, ri);
   NoteColorPass(t, cb, ri, false);
@@ -1674,6 +1691,7 @@ VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRendering(VkCommandBuffer cb, const VkRe
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* ri) {
   TlsCb& t = CbState(cb);
+  NoteScenePass(t.dd, ri);
   BeginRenderingCommon(t, ri);
   CalibBeforePass(t, cb, ri);
   NoteColorPass(t, cb, ri, true);
@@ -1693,6 +1711,32 @@ VKAPI_ATTR void VKAPI_CALL hook_CmdEndRenderingKHR(VkCommandBuffer cb) {
   TraceEnd(t);
   EndRenderingCommon(t, cb);
   AfterColorPass(t, cb);
+}
+// alternate / replay with fix_shadows: only the scene viewport width (no depth-mode work)
+VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRenderingSF(VkCommandBuffer cb, const VkRenderingInfo* ri) {
+  TlsCb& t = CbState(cb);
+  NoteScenePass(t.dd, ri);
+  t.dd->d.CmdBeginRendering(cb, ri);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdBeginRenderingKHRSF(VkCommandBuffer cb, const VkRenderingInfo* ri) {
+  TlsCb& t = CbState(cb);
+  NoteScenePass(t.dd, ri);
+  (t.dd->d.CmdBeginRenderingKHR ? t.dd->d.CmdBeginRenderingKHR : t.dd->d.CmdBeginRendering)(cb, ri);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportSF(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
+  TlsCb& t = CbState(cb);
+  NoteSceneViewport(t.dd, n, v);
+  t.dd->d.CmdSetViewport(cb, first, n, v);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportWithCountSF(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
+  TlsCb& t = CbState(cb);
+  NoteSceneViewport(t.dd, n, v);
+  (t.dd->d.CmdSetViewportWithCount ? t.dd->d.CmdSetViewportWithCount : t.dd->d.CmdSetViewportWithCountEXT)(cb, n, v);
+}
+VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportWithCountEXTSF(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
+  TlsCb& t = CbState(cb);
+  NoteSceneViewport(t.dd, n, v);
+  (t.dd->d.CmdSetViewportWithCountEXT ? t.dd->d.CmdSetViewportWithCountEXT : t.dd->d.CmdSetViewportWithCount)(cb, n, v);
 }
 void NoteRenderPass(DeviceData* dd) {
   if (!dd->loggedRenderPass.exchange(true))
@@ -1730,16 +1774,19 @@ void NoteViewports(uint32_t n, const VkViewport* v) {
 VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
   TlsCb& t = CbState(cb);
   NoteViewports(n, v);
+  NoteSceneViewport(t.dd, n, v);
   t.dd->d.CmdSetViewport(cb, first, n, v);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
   TlsCb& t = CbState(cb);
   NoteViewports(n, v);
+  NoteSceneViewport(t.dd, n, v);
   (t.dd->d.CmdSetViewportWithCount ? t.dd->d.CmdSetViewportWithCount : t.dd->d.CmdSetViewportWithCountEXT)(cb, n, v);
 }
 VKAPI_ATTR void VKAPI_CALL hook_CmdSetViewportWithCountEXT(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
   TlsCb& t = CbState(cb);
   NoteViewports(n, v);
+  NoteSceneViewport(t.dd, n, v);
   (t.dd->d.CmdSetViewportWithCountEXT ? t.dd->d.CmdSetViewportWithCountEXT : t.dd->d.CmdSetViewportWithCount)(cb, n, v);
 }
 
@@ -2830,7 +2877,10 @@ bool PatchCode(DeviceData* dd, const uint32_t* code, size_t words, uint32_t mode
     PatchResult pr = PatchScreenSpace(code, words, dd->paramAddr, out, &log);
     if (pr != PatchResult::Patched) return false;
     uint32_t n = ++dd->screenFixCount;
-    Log(1, "fix_shadows: %s shader #%u corrected (%s)", model == 4 ? "fragment" : "compute", n, log.c_str());
+    // (the scene's materials rebuild their position from SvPosition too: hundreds of shaders, only
+    // the first ones are listed; the periodic line counts them all)
+    Log(n <= 12 ? 1 : 2, "fix_shadows: %s shader #%u corrected (%s)", model == 4 ? "fragment" : "compute", n,
+        log.c_str());
     return true;
   }
   PatchResult pr = PatchStereo(code, words, entry, model, dd->paramAddr, out, &log, dd->canCalib && dd->depthMode);
@@ -3203,14 +3253,14 @@ bool WritePPM(DeviceData* dd, HostBuf& hb, VkFormat fmt, VkExtent2D e, const std
 void UpdateParams(DeviceData* dd, VkCommandBuffer cb, float k) {
   const VkPipelineStageFlags ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, XFER = VK_PIPELINE_STAGE_TRANSFER_BIT;
   // (params[3], the projection-sample flag, belongs to the scene's passes in depth / hybrid mode)
-  float data[5] = {k, Cfg().convergence, HudFactor(), 0.0f, ScreenFixFactor()};
+  float data[6] = {k, Cfg().convergence, HudFactor(), 0.0f, ScreenFixFactor(), dd->sceneVpW.load()};
   VkMemoryBarrier pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER};  // after earlier reads and the previous update
   pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   dd->d.CmdPipelineBarrier(cb, ALL, XFER, 0, 1, &pre, 0, nullptr, 0, nullptr);
   if (dd->depthMode) {
     dd->d.CmdUpdateBuffer(cb, dd->paramBuf, 0, 12, data);
-    dd->d.CmdUpdateBuffer(cb, dd->paramBuf, 16, 4, &data[4]);
+    dd->d.CmdUpdateBuffer(cb, dd->paramBuf, 16, 8, &data[4]);
   } else {
     dd->d.CmdUpdateBuffer(cb, dd->paramBuf, 0, sizeof(data), data);
   }
@@ -4028,8 +4078,8 @@ void LogStats(DeviceData* dd, Swapchain* sc, bool replayStats) {
     if (a != dd->lastFixLog[0] || b != dd->lastFixLog[1]) {
       dd->lastFixLog[0] = a;
       dd->lastFixLog[1] = b;
-      Log(1, "fix_shadows: %u shaders corrected, %u shadow-map pipelines unshifted (Ctrl+Shift+Pause: %s)", a, b,
-          Cfg().fixShadowsOn ? "on" : "off");
+      Log(1, "fix_shadows: %u shaders corrected, %u shadow-map pipelines unshifted, scene viewport %.0f px "
+          "(Ctrl+Shift+Pause: %s)", a, b, double(dd->sceneVpW.load()), Cfg().fixShadowsOn ? "on" : "off");
     }
   }
   if (replayStats) {
@@ -5104,6 +5154,11 @@ PFN_vkVoidFunction DeviceHook(const char* name) {
   }
   if (Cfg().mode == 2 || Cfg().mode == 3) {  // depth / hybrid: finds and copies the scene's depth buffer
     DEPTH_HOOKS(CHECK)
+  } else if (Cfg().fixShadows) {             // the scene viewport width for the SvPosition correction
+#define CHECK_SF(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)&hook_##n##SF;
+    CHECK_SF(CmdBeginRendering) CHECK_SF(CmdBeginRenderingKHR) CHECK_SF(CmdSetViewport)
+    CHECK_SF(CmdSetViewportWithCount) CHECK_SF(CmdSetViewportWithCountEXT)
+#undef CHECK_SF
   }
   if (Cfg().dumpShaders || Cfg().fixShadows) {  // shader dump / screen-space fixes see the compute shaders
     CHECK(CreateComputePipelines)

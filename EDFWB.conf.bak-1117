@@ -1,0 +1,20 @@
+# 3dvisionlinux profile for EDFWB-Win64-Shipping.exe
+separation = 0.02500
+convergence = 1148.24658
+swap_eyes = 0
+stereo = 1
+mode = alternate
+zoom = 1.0000
+fps_limit = 0.0
+hud_depth = 0.0000
+auto_switch = 1
+crop = 0
+emitter_delay_us = -275
+emitter_invert = 0
+skip_repeats = 0
+shift_shadows = 1
+fix_shadows = auto
+hud_separation = 0
+hud_split = auto
+flat_menus = 0
+depth_layers = latest
