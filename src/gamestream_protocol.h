@@ -7,8 +7,9 @@
 #include <stdint.h>
 
 #define GS_SOCKET_NAME   "gamestream-capture-v1"   // namespace abstracto (\0 delante)
-#define GS_PROTO_VERSION 1
+#define GS_PROTO_VERSION 2
 #define GS_MAX_SLOTS     6
+#define GS_MAX_STREAMS   3   // resoluciones de salida distintas a la vez (p. ej. 4K YouTube + 1080p Twitch)
 
 enum GsMsgType : uint32_t {
     GS_HELLO = 1,     // capa/ctl -> daemon
@@ -33,19 +34,22 @@ struct GsHello {
     char     exe[128];
 };
 
+// Llegan nslots*nstreams fds, en orden: fd[slot * nstreams + stream]
 struct GsTextures {
     uint32_t type;      // GS_TEXTURES
+    uint32_t version;   // GS_PROTO_VERSION
     uint32_t generation;
-    uint32_t width, height;   // tamaño de salida (lo que se codifica)
-    uint32_t pitch;           // bytes por fila en el buffer (alineado a 256)
     uint32_t nslots;
-    uint64_t alloc_size;      // tamaño de la VkDeviceMemory exportada
+    uint32_t nstreams;
+    uint32_t width[GS_MAX_STREAMS], height[GS_MAX_STREAMS];   // tamaño de cada salida
+    uint32_t pitch[GS_MAX_STREAMS];                          // bytes por fila (alineado a 256)
+    uint64_t alloc_size[GS_MAX_STREAMS];                     // tamaño de cada VkDeviceMemory
     uint32_t dedicated;       // la memoria es "dedicated allocation"
     uint32_t has_uuid;
     uint8_t  device_uuid[16]; // VkPhysicalDeviceIDProperties::deviceUUID
     uint32_t pixfmt;          // 0 = BGRA8 (siempre por ahora)
     uint32_t stereo;          // 0 = 2D, 1 = 3D lado a lado comprimido (half SBS), 2 = lado a lado completo
-                              // (añadido después: un mensaje sin este campo es 2D)
+                              // (la capa 3D Vision; un mensaje sin este campo es 2D)
 };
 
 struct GsFrame {
@@ -58,8 +62,10 @@ struct GsFrame {
 
 struct GsStart {
     uint32_t type;      // GS_START
-    uint32_t width, height;   // 0x0 = usa la resolución del juego
+    uint32_t version;   // GS_PROTO_VERSION
     uint32_t fps;
+    uint32_t nstreams;  // cuántas resoluciones de salida
+    uint32_t width[GS_MAX_STREAMS], height[GS_MAX_STREAMS];   // 0x0 = la del juego
 };
 
 struct GsSimple {       // GS_TOGGLE, GS_STOP
@@ -83,3 +89,4 @@ struct GsCtlReply {
 };
 
 #define GS_MAX_MSG 512
+static_assert(sizeof(GsTextures) <= GS_MAX_MSG, "GsTextures demasiado grande");

@@ -17,9 +17,11 @@
 
 enum { kStreamFree = 0, kStreamGpu = 1, kStreamDaemon = 2 };
 
+// gamestreamd can ask for up to GS_MAX_STREAMS sizes at once (one per destination resolution,
+// e.g. 4K for YouTube and 1080p for Twitch): every slot has one buffer per size.
 struct StreamSlot {
-  VkBuffer buf = VK_NULL_HANDLE;
-  VkDeviceMemory mem = VK_NULL_HANDLE;
+  VkBuffer buf[GS_MAX_STREAMS] = {};
+  VkDeviceMemory mem[GS_MAX_STREAMS] = {};
   VkCommandBuffer cb = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
   std::atomic<int> state{kStreamFree};
@@ -36,18 +38,21 @@ struct Streamer {
   std::atomic<bool> connected{false};
 
   std::atomic<bool> want{false};
-  std::atomic<uint32_t> reqW{0}, reqH{0}, reqFps{60}, session{0};
+  std::mutex reqM;
+  uint32_t reqN = 1, reqW[GS_MAX_STREAMS] = {}, reqH[GS_MAX_STREAMS] = {};
+  std::atomic<uint32_t> reqFps{60}, session{0};
 
   std::mutex resM;  // the resources below
   bool valid = false;
   uint32_t resSession = 0, family = UINT32_MAX;
   VkCommandPool pool = VK_NULL_HANDLE;
-  uint32_t outW = 0, outH = 0, pitch = 0, fps = 60, nslots = 4;
-  VkDeviceSize allocSize = 0;
+  uint32_t nstreams = 1, fps = 60, nslots = 4;
+  uint32_t outW[GS_MAX_STREAMS] = {}, outH[GS_MAX_STREAMS] = {}, pitch[GS_MAX_STREAMS] = {};
+  VkDeviceSize allocSize[GS_MAX_STREAMS] = {};
   StreamSlot slots[GS_MAX_SLOTS];
   std::atomic<uint32_t> gen{0};
-  VkImage interm = VK_NULL_HANDLE;  // the side-by-side frame, before the copy to the buffer
-  VkDeviceMemory intermMem = VK_NULL_HANDLE;
+  VkImage interm[GS_MAX_STREAMS] = {};  // the side-by-side frames, before the copy to the buffers
+  VkDeviceMemory intermMem[GS_MAX_STREAMS] = {};
   VkFormat intermFmt = VK_FORMAT_UNDEFINED;
   uint64_t nextDue = 0, sent = 0, dropped = 0;
 
@@ -69,7 +74,7 @@ static bool StreamSend(Streamer* s, const void* data, size_t len, const int* fds
   msghdr mh{};
   mh.msg_iov = &iov;
   mh.msg_iovlen = 1;
-  char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS)];
+  char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS * GS_MAX_STREAMS)];
   if (nfds > 0) {
     memset(cbuf, 0, sizeof cbuf);
     mh.msg_control = cbuf;
@@ -132,12 +137,27 @@ static void StreamHandle(Streamer* s, const char* buf, ssize_t n) {
   if (type == GS_START && n >= ssize_t(sizeof(GsStart))) {
     GsStart st;
     memcpy(&st, buf, sizeof st);
-    s->reqW = st.width;
-    s->reqH = st.height;
+    if (st.version != GS_PROTO_VERSION) {
+      Log(0, "live streaming: gamestreamd speaks protocol %u, this layer %u: rebuild 3dvisionlinux with the "
+             "gamestream_protocol.h of the installed gamecapture", st.version, GS_PROTO_VERSION);
+      return;
+    }
+    std::string sizes;
+    {
+      std::lock_guard<std::mutex> l(s->reqM);
+      s->reqN = std::min<uint32_t>(std::max<uint32_t>(st.nstreams, 1), GS_MAX_STREAMS);
+      for (uint32_t k = 0; k < s->reqN; ++k) {
+        s->reqW[k] = st.width[k];
+        s->reqH[k] = st.height[k];
+        char b[32];
+        snprintf(b, sizeof b, "%s%ux%u", k ? " + " : "", st.width[k], st.height[k]);
+        sizes += b;
+      }
+    }
     s->reqFps = st.fps ? st.fps : 60;
     ++s->session;
     s->want = true;
-    Log(1, "live streaming: start (%ux%u %s @ %u fps)", st.width, st.height, Cfg().streamFull ? "full SBS" : "half SBS",
+    Log(1, "live streaming: start (%s %s @ %u fps)", sizes.c_str(), Cfg().streamFull ? "full SBS" : "half SBS",
         s->reqFps.load());
   } else if (type == GS_STOP) {
     s->want = false;
@@ -232,22 +252,26 @@ static int StreamMemType(DeviceData* dd, uint32_t bits) {
 static void StreamDestroyLocked(Streamer* s) {
   DeviceData* dd = s->dd;
   for (auto& sl : s->slots) {
-    if (sl.buf) dd->d.DestroyBuffer(dd->device, sl.buf, nullptr);
-    if (sl.mem) dd->d.FreeMemory(dd->device, sl.mem, nullptr);  // the daemon keeps its own reference
+    for (uint32_t k = 0; k < GS_MAX_STREAMS; ++k) {
+      if (sl.buf[k]) dd->d.DestroyBuffer(dd->device, sl.buf[k], nullptr);
+      if (sl.mem[k]) dd->d.FreeMemory(dd->device, sl.mem[k], nullptr);  // the daemon keeps its own reference
+      sl.buf[k] = VK_NULL_HANDLE;
+      sl.mem[k] = VK_NULL_HANDLE;
+    }
     if (sl.fence) dd->d.DestroyFence(dd->device, sl.fence, nullptr);
     if (sl.cb) dd->d.FreeCommandBuffers(dd->device, s->pool, 1, &sl.cb);
-    sl.buf = VK_NULL_HANDLE;
-    sl.mem = VK_NULL_HANDLE;
     sl.fence = VK_NULL_HANDLE;
     sl.cb = VK_NULL_HANDLE;
     sl.state = kStreamFree;
   }
   if (s->pool) dd->d.DestroyCommandPool(dd->device, s->pool, nullptr);
   s->pool = VK_NULL_HANDLE;
-  if (s->interm) dd->d.DestroyImage(dd->device, s->interm, nullptr);
-  if (s->intermMem) dd->d.FreeMemory(dd->device, s->intermMem, nullptr);
-  s->interm = VK_NULL_HANDLE;
-  s->intermMem = VK_NULL_HANDLE;
+  for (uint32_t k = 0; k < GS_MAX_STREAMS; ++k) {
+    if (s->interm[k]) dd->d.DestroyImage(dd->device, s->interm[k], nullptr);
+    if (s->intermMem[k]) dd->d.FreeMemory(dd->device, s->intermMem[k], nullptr);
+    s->interm[k] = VK_NULL_HANDLE;
+    s->intermMem[k] = VK_NULL_HANDLE;
+  }
   s->valid = false;
 }
 
@@ -271,18 +295,25 @@ static bool IsSrgbFormat(VkFormat f) {
 static bool StreamCreate(Streamer* s, uint32_t fam, VkExtent2D eye, VkFormat eyeFmt) {
   DeviceData* dd = s->dd;
   std::lock_guard<std::mutex> l(s->resM);
-  // the daemon's resolution (gamestream.conf, 1920x1080 by default) is the whole side-by-side
-  // frame (half SBS); full SBS: each eye has it; "auto" (0x0): each eye at the monitor's size
-  uint32_t w = s->reqW, h = s->reqH;
-  if (!w || !h) {
-    w = Cfg().streamFull ? eye.width * 2 : eye.width;
-    h = eye.height;
-  } else if (Cfg().streamFull) {
-    w *= 2;
+  // each resolution of the daemon (gamestream.conf, 1920x1080 by default) is the whole
+  // side-by-side frame (half SBS); full SBS: each eye has it; "auto" (0x0): each eye at the
+  // monitor's size
+  {
+    std::lock_guard<std::mutex> lr(s->reqM);
+    s->nstreams = s->reqN;
+    for (uint32_t k = 0; k < s->nstreams; ++k) {
+      uint32_t w = s->reqW[k], h = s->reqH[k];
+      if (!w || !h) {
+        w = Cfg().streamFull ? eye.width * 2 : eye.width;
+        h = eye.height;
+      } else if (Cfg().streamFull) {
+        w *= 2;
+      }
+      s->outW[k] = w & ~3u;  // even halves, even size for NVENC
+      s->outH[k] = h & ~1u;
+      s->pitch[k] = (s->outW[k] * 4 + 255) & ~255u;
+    }
   }
-  s->outW = w & ~3u;  // even halves, even size for NVENC
-  s->outH = h & ~1u;
-  s->pitch = (s->outW * 4 + 255) & ~255u;
   s->fps = s->reqFps;
   s->nslots = 4;
   s->family = fam;
@@ -293,16 +324,19 @@ static bool StreamCreate(Streamer* s, uint32_t fam, VkExtent2D eye, VkFormat eye
     StreamDestroyLocked(s);
     return false;
   }
-  // the side-by-side picture (sRGB like the eyes, so a blit does not change the colours)
-  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ici.imageType = VK_IMAGE_TYPE_2D;
-  ici.format = s->intermFmt = IsSrgbFormat(eyeFmt) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
-  ici.extent = {s->outW, s->outH, 1};
-  ici.mipLevels = ici.arrayLayers = 1;
-  ici.samples = VK_SAMPLE_COUNT_1_BIT;
-  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  bool ok = CreateImageMem(dd, ici, &s->interm, &s->intermMem);
+  // the side-by-side pictures (sRGB like the eyes, so a blit does not change the colours)
+  bool ok = true;
+  for (uint32_t k = 0; k < s->nstreams && ok; ++k) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = s->intermFmt = IsSrgbFormat(eyeFmt) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+    ici.extent = {s->outW[k], s->outH[k], 1};
+    ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ok = CreateImageMem(dd, ici, &s->interm[k], &s->intermMem[k]);
+  }
   std::vector<int> fds;
   for (uint32_t i = 0; i < s->nslots && ok; ++i) {
     StreamSlot& sl = s->slots[i];
@@ -314,48 +348,56 @@ static bool StreamCreate(Streamer* s, uint32_t fam, VkExtent2D eye, VkFormat eye
     if (!ok) break;
     if (dd->setLoaderData) dd->setLoaderData(dd->device, sl.cb);
     else *(void**)sl.cb = *(void**)dd->device;
-    VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
-    ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi};
-    bci.size = VkDeviceSize(s->pitch) * s->outH;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    ok = dd->d.CreateBuffer(dd->device, &bci, nullptr, &sl.buf) == VK_SUCCESS;
+    // fds go in the order fd[slot * nstreams + stream]
+    for (uint32_t k = 0; k < s->nstreams && ok; ++k) {
+      VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+      ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi};
+      bci.size = VkDeviceSize(s->pitch[k]) * s->outH[k];
+      bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      ok = dd->d.CreateBuffer(dd->device, &bci, nullptr, &sl.buf[k]) == VK_SUCCESS;
+      if (!ok) break;
+      VkMemoryRequirements mr;
+      dd->d.GetBufferMemoryRequirements(dd->device, sl.buf[k], &mr);
+      VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+      ded.buffer = sl.buf[k];
+      VkExportMemoryAllocateInfo exp{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                     dd->streamDedicated ? (void*)&ded : nullptr};
+      exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp};
+      mai.allocationSize = mr.size;
+      int mt = StreamMemType(dd, mr.memoryTypeBits);
+      mai.memoryTypeIndex = uint32_t(mt);
+      ok = mt >= 0 && dd->d.AllocateMemory(dd->device, &mai, nullptr, &sl.mem[k]) == VK_SUCCESS &&
+           dd->d.BindBufferMemory(dd->device, sl.buf[k], sl.mem[k], 0) == VK_SUCCESS;
+      if (!ok) break;
+      s->allocSize[k] = mr.size;
+      VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+      gi.memory = sl.mem[k];
+      gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      int fd = -1;
+      ok = dd->getMemoryFd(dd->device, &gi, &fd) == VK_SUCCESS && fd >= 0;
+      if (ok) fds.push_back(fd);
+    }
     if (!ok) break;
-    VkMemoryRequirements mr;
-    dd->d.GetBufferMemoryRequirements(dd->device, sl.buf, &mr);
-    VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
-    ded.buffer = sl.buf;
-    VkExportMemoryAllocateInfo exp{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-                                   dd->streamDedicated ? (void*)&ded : nullptr};
-    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp};
-    mai.allocationSize = mr.size;
-    int mt = StreamMemType(dd, mr.memoryTypeBits);
-    mai.memoryTypeIndex = uint32_t(mt);
-    ok = mt >= 0 && dd->d.AllocateMemory(dd->device, &mai, nullptr, &sl.mem) == VK_SUCCESS &&
-         dd->d.BindBufferMemory(dd->device, sl.buf, sl.mem, 0) == VK_SUCCESS;
-    if (!ok) break;
-    s->allocSize = mr.size;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     ok = dd->d.CreateFence(dd->device, &fci, nullptr, &sl.fence) == VK_SUCCESS;
     if (!ok) break;
-    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
-    gi.memory = sl.mem;
-    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    int fd = -1;
-    ok = dd->getMemoryFd(dd->device, &gi, &fd) == VK_SUCCESS && fd >= 0;
-    if (ok) fds.push_back(fd);
     sl.state = kStreamFree;
   }
   if (ok) {
     GsTextures t{};
     t.type = GS_TEXTURES;
+    t.version = GS_PROTO_VERSION;
     t.generation = ++s->gen;
-    t.width = s->outW;
-    t.height = s->outH;
-    t.pitch = s->pitch;
     t.nslots = s->nslots;
-    t.alloc_size = s->allocSize;
+    t.nstreams = s->nstreams;
+    for (uint32_t k = 0; k < s->nstreams; ++k) {
+      t.width[k] = s->outW[k];
+      t.height[k] = s->outH[k];
+      t.pitch[k] = s->pitch[k];
+      t.alloc_size[k] = s->allocSize[k];
+    }
     t.dedicated = dd->streamDedicated;
     t.has_uuid = dd->streamHasUuid;
     memcpy(t.device_uuid, dd->streamUuid, 16);
@@ -372,8 +414,9 @@ static bool StreamCreate(Streamer* s, uint32_t fam, VkExtent2D eye, VkFormat eye
   s->valid = true;
   s->resSession = s->session;
   s->nextDue = 0;
-  Log(1, "live streaming: %ux%u side by side (%s), each eye %ux%u, %u fps", s->outW, s->outH,
-      Cfg().streamFull ? "full SBS" : "half SBS", s->outW / 2, s->outH, s->fps);
+  for (uint32_t k = 0; k < s->nstreams; ++k)
+    Log(1, "live streaming: %ux%u side by side (%s), each eye %ux%u, %u fps", s->outW[k], s->outH[k],
+        Cfg().streamFull ? "full SBS" : "half SBS", s->outW[k] / 2, s->outH[k], s->fps);
   return true;
 }
 
@@ -414,29 +457,31 @@ void StreamPair(DeviceData* dd, Swapchain* sc, VkQueue q, int slot) {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   dd->d.BeginCommandBuffer(cb, &bi);
   const VkPipelineStageFlags XFER = VK_PIPELINE_STAGE_TRANSFER_BIT, ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-  Barrier(dd, cb, s->interm, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, XFER, 0, XFER,
-          VK_ACCESS_TRANSFER_WRITE_BIT);
-  const int32_t half = int32_t(s->outW / 2);
-  for (int e = 0; e < 2; ++e) {
-    VkImage src = sc->slots[slot].img[e];
-    Barrier(dd, cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, ALL, VK_ACCESS_MEMORY_WRITE_BIT, XFER,
-            VK_ACCESS_TRANSFER_READ_BIT);
-    VkImageBlit b{};
-    b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    b.srcOffsets[1] = {int32_t(sc->rext.width), int32_t(sc->rext.height), 1};
-    b.dstOffsets[0] = {e * half, 0, 0};
-    b.dstOffsets[1] = {(e + 1) * half, int32_t(s->outH), 1};
-    dd->d.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, s->interm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
-                       VK_FILTER_LINEAR);
+  for (int e = 0; e < 2; ++e)
+    Barrier(dd, cb, sc->slots[slot].img[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, ALL,
+            VK_ACCESS_MEMORY_WRITE_BIT, XFER, VK_ACCESS_TRANSFER_READ_BIT);
+  for (uint32_t k = 0; k < s->nstreams; ++k) {
+    Barrier(dd, cb, s->interm[k], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, XFER, 0, XFER,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+    const int32_t half = int32_t(s->outW[k] / 2);
+    for (int e = 0; e < 2; ++e) {
+      VkImageBlit b{};
+      b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      b.srcOffsets[1] = {int32_t(sc->rext.width), int32_t(sc->rext.height), 1};
+      b.dstOffsets[0] = {e * half, 0, 0};
+      b.dstOffsets[1] = {(e + 1) * half, int32_t(s->outH[k]), 1};
+      dd->d.CmdBlitImage(cb, sc->slots[slot].img[e], VK_IMAGE_LAYOUT_GENERAL, s->interm[k],
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    Barrier(dd, cb, s->interm[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, XFER,
+            VK_ACCESS_TRANSFER_WRITE_BIT, XFER, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy c{};
+    c.bufferRowLength = s->pitch[k] / 4;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {s->outW[k], s->outH[k], 1};
+    dd->d.CmdCopyImageToBuffer(cb, s->interm[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl.buf[k], 1, &c);
   }
-  Barrier(dd, cb, s->interm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, XFER,
-          VK_ACCESS_TRANSFER_WRITE_BIT, XFER, VK_ACCESS_TRANSFER_READ_BIT);
-  VkBufferImageCopy c{};
-  c.bufferRowLength = s->pitch / 4;
-  c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  c.imageExtent = {s->outW, s->outH, 1};
-  dd->d.CmdCopyImageToBuffer(cb, s->interm, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl.buf, 1, &c);
   dd->d.EndCommandBuffer(cb);
   dd->d.ResetFences(dd->device, 1, &sl.fence);
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
